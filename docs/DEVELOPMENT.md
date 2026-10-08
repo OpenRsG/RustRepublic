@@ -1,0 +1,387 @@
+# RiderRepRust: development notes
+
+Detailed design, verification history and the optional asset-research tools.
+The player-facing overview is in [README.md](../README.md).
+The simulation, bike model, skier and rider rigs are independently authored in this
+repository; this is **not verified original-game physics or animation parity**.
+
+## Play
+
+```sh
+cargo run --locked
+```
+
+Requires Rust 1.88+, a C compiler, Linux X11/Wayland development libraries and a
+working Vulkan graphics driver. Development dependencies are optimized; a release
+build is optional (`cargo run --release --locked`).
+
+The game runs without a Riders Republic installation. The white arena retains
+three small jumps and adds a **32 m hill with a 7 m kicker** at x = 60 m.
+The forest, mountains, gates, sky dome and dirt course remain removed.
+Keys **1–4** select Downhill, Road, Slopestyle and Freeride. Switching resets to the
+flat start; R resets without changing the selected discipline.
+Each profile has authored spring/damper, power, drag, tire grip, hop and air-control
+settings. Bars, saddle height, tire width, frame and jersey colors change too;
+Road has narrow drop grips, smooth tires and a visually rigid frame/fork.
+All four retain the shared wheel radius, wheelbase and bounded two-strut contact model.
+The fixed 120 Hz simulation supports pedaling, sprinting, braking, steering/lean,
+hops, wheelies, rear-wheel manuals, nose manuals and physical flips, rolls and yaw spins.
+Wheel spin, drivetrain and suspension movement feed the same animated rig.
+
+The live skeleton overlay is enabled at launch and uses the same solved joints
+as the rider animation. Blue marks the left side, pink the right and green the
+spine/head; skeleton-only mode uses darker hues for contrast on the white floor.
+Hands and feet release for tricks and blend back to the bike before landing.
+Released hands have their own joint positions, not debug lines falsely tied to grips.
+Crashed riders turn red and release the bike into a **23-joint ragdoll**.
+The rider's limbs articulate, collide with the floor, tumble and slide independently
+of the bike; the camera follows the fallen rider's pelvis.
+
+The GTA-style third-person camera follows behind the direction of travel (not the
+spinning body) with critically damped focus, heading and elevation, velocity
+look-ahead, and a wider FOV and longer arm at speed. Landings dip and settle
+instead of snapping. Hold the right mouse button to orbit, scroll to zoom (3–14 m),
+or press C to recenter. It also recenters automatically while riding after orbit
+input stops. Rising ground behind the rider (hill descents, ramp faces) lifts the
+camera over it instead of pulling it down to the rider; the horizon stays upright.
+Braking and drive forces act at the actual tire patches and are capped by wheel
+load, so unloading a wheel fades its force instead of switching brake torque abruptly.
+
+| Keys | Action |
+| --- | --- |
+| 1 / 2 / 3 / 4 | Select Downhill / Road / Slopestyle / Freeride; reset to start |
+| W / S | Pedal / brake |
+| A / D | Steer left / right |
+| Shift | Sprint while pedaling |
+| Space | Hop; holding does not re-hop on landing |
+| Q | Assisted wheelie |
+| Up / Down | Nose down / up while airborne |
+| Left / Right | Airborne roll |
+| Z / X | Rear-wheel manual / nose manual while moving; no pedaling required |
+| E / T | Airborne yaw spin right / left |
+| Ctrl + Up / Down | Higher-authority physical forward / backward flip; counter-input brakes rotation |
+| Ctrl + Left / Right | Higher-authority physical barrel rotation |
+| U / I / O | Cycle selected hand / foot / bike trick, including None |
+| B | Hold selected trick combination while airborne |
+| J / L | Select left / right trick side |
+| Right mouse drag | Orbit the third-person camera |
+| Mouse wheel | Zoom camera |
+| C | Recenter behind the bike |
+| F1 | Toggle skeleton overlay |
+| F2 | Toggle rider mesh / skeleton-only view; bike stays visible |
+| F6 | Toggle looping hill showcase; starting it selects Freeride and the summit |
+| R | Clear crash/reset bike and animation; during F6, restart the current demonstration |
+| Esc | Pause/resume physics and animation; camera remains operable |
+| H | Show/hide controls |
+| F3 | Log physics, crash reason/impact, animation layers, angular rates, demo stage and camera |
+
+Losing window focus suspends physics and animation. Terrain contact is a shared
+analytic heightfield, not a general rigid-body collision world. Normal balance,
+steering and rate damping remain arcade-assisted; air motion has no target-attitude
+torque. Full flips and rolls are now the bike's **physical quaternion orientation**,
+with momentum and ordinary collision tests—not independent visual layers.
+
+### Browser (WebGPU)
+
+```sh
+scripts/web.sh   # writes target/www: index.html, JS glue, 24 MB wasm
+```
+
+Needs the `wasm32-unknown-unknown` standard library (Arch: `rust-wasm`) and
+`wasm-bindgen-cli` at the `wasm-bindgen` version in `Cargo.lock`
+(`cargo install --locked wasm-bindgen-cli --version 0.2.129`). It uses the `web` profile
+(size-optimised, stripped). The page needs WebGPU, so serve it over HTTPS or `localhost`.
+It opens in ski mode with the F6 showcase looping and keeps running without focus;
+click the canvas to use the keys. Browsers may keep F-keys, so reload to restart the
+showcase. WebGL is not built. On portrait screens the camera keeps a 4:3 horizontal field of
+view (vertical FOV up to 100 degrees, `hor_plus` in `src/game.rs`) and tilts down; the HUD
+scales with `UiScale`, key help hides on turning portrait, one finger orbits and two pinch-zoom.
+The web build starts with the skeleton overlay off.
+
+To share it on a tailnet, `sudo tailscale serve --bg --https=8443 <repo>/target/www`
+serves it at `https://<host>.<tailnet>.ts.net:8443/`. Rebuilding updates it in place.
+
+## Ski mode
+
+Press **5** for a skier; **1–4** return to the bike. The code is in `src/ski/` and was written for this project. It is not decoded retail behaviour.
+- Skeleton (`pose.rs`): 23 body joints plus ski tail/binding/upturned tip and pole top/tip, with fixed bone lengths. Segment lengths, hip and shoulder width and the 0.366 m ski stance follow the decoded retail rider rig's proportions; the ski is 1.5 m, longer than the 1.26 m between the retail ski end bones. F1/F2 and the overlay colours work the same as for the bike.
+- Physics (`physics.rs`, 120 Hz): slope gravity, snow friction, drag with a lighter tuck, sidecut carving and edge grip, skidding, skating (below 4 m/s), double-poling, snowplow and hockey stop, and switch riding. Hold Space to crouch and release to jump; the legs absorb landings. In the air you get free-quaternion spins and flips. Landings are judged before any penetration is corrected: a bad angle, crossed skis or too much spin, a hard impact, a body strike, or a caught edge is a crash.
+- Animation (`anim.rs`, `rig.rs`): athletic stance, carve inclination and angulation with knee drive, tuck, plow with knees in, hockey stop, V-skate and double-pole with stride rates that rise with speed, jump preload, landing absorption, and switch stance. Grabs: Mute, Safety, Japan, Tail, Tip, Truck Driver, Daffy, Spread Eagle and Iron Cross. Grabs release about 0.35 s before the predicted landing. Blend weights are springs, so poses never snap between ticks; a touchdown eases the pose from its in-air attitude onto the snow over about 0.15 s. The drawn skier and camera are interpolated between the 120 Hz physics ticks.
+- Secondary motion: breathing and slow weight shifts, a chest that lags the skis' turn (counter-rotation), a head that stays level and keeps looking downhill, free hands that trail the body's acceleration, a deep preload crouch whose arms swing back before the pop, a race tuck with the back about 25 degrees above horizontal and fists at the knees, a touchdown that reaches its deepest point about 0.2 s after contact (torso folded about 65 degrees, wider stance, brief visual skid across the line of travel) and is back near neutral about 0.5 s later, and an inside-pole plant at each carve change. Timings and postures were tuned against retail reference video, clip durations and decoded retail air/ollie curves, not copied from retail data.
+- Flat ground: skating is a stroke cycle. On each stroke one ski edges and pushes out and back while the hips cross over to the other ski; the pushing ski then lifts, swings in and lands as the next stroke begins. Both skis sit about 12 degrees off the travel line, a V of roughly 23 degrees with the tails close. The skier travels along the ski it glides on, so that ski never slides, and the body weaves slightly as the weight moves. The pushing foot ends about 0.5 m from the glide foot with a nearly straight leg; the glide knee is flexed 50–60 degrees, with the trunk leaning 30–40 degrees forward over it. Strokes take about 0.95 s from standstill and 0.6 s at 4 m/s, and start short and upright. From about 2 m/s the poles push on every stroke (V2); below that it is free skate with the arms swinging across. Double poling runs a cycle of 1.2 s down to 0.9 s, faster with speed: poles plant ahead of the binding, the trunk crunches from near upright to about 55 degrees off vertical with the hips and knees flexing in step, and the hands finish past the hips. Speed is gained only in the push window of each stroke or cycle. No retail footage of skating or poling exists, so these follow real cross-country technique rather than a game reference.
+- Crashes hand over to a separate position-based ragdoll (`ragdoll.rs`). Skis and poles stay attached, skis slide along their length more easily than sideways, and knees only bend forwards.
+- F6 in ski mode loops: slalom + 360 Mute, backflip Safety, 540 Japan (lands switch), Daffy, then a deliberately incomplete front flip that crashes.
+
+Keys: W skate/pole, S plow/hockey stop, A/D carve, Shift tuck, Space jump, arrows flip/roll, E/T spin, Ctrl full flips, U picks the grab, B holds it, J/L picks the side, R resets.
+
+## Crashes and landing rules
+
+Touchdown is judged **before** the bump stop changes velocity or contact flags.
+The checks use terrain normals, actual posed wheel centres/axles and angular rates:
+- Excess nose angle, sideways tilt, travel/heading mismatch or spin at contact
+  causes a bad landing. Inverted rider/frame impacts can occur before a wheel lands.
+- Both feet still released at touchdown cause missing-support failure.
+- A fully detached rider cannot apply steering, pedaling, hop or air-control torque.
+- Twelve posed rider/frame sphere proxies detect head, torso, knees, hands and bike
+  strikes. They follow the same rig and trick assembly transforms as the meshes.
+- Closing speed above 22 m/s causes a hard-impact crash. Thresholds are authored
+  constants in `src/bike.rs`, relative to the local surface, not retail measurements.
+
+A crashed bike ignores riding inputs and falls, bounces, slides and tumbles with
+gravity, friction and angular impulses. The detached rider inherits linear/angular
+momentum and limb motion from the impact pose. Mass-weighted bone constraints,
+bounded joints and passive joint friction keep the ragdoll articulated; joint
+spheres and sampled bone capsules collide with the shared terrain.
+Penetration repair is separate from contact velocity, so getting out of the floor
+does not launch the rider. Resting bodies sleep instead of continually jittering.
+The crash persists until **R**, except that F6 explicitly resets between runs.
+Pause/focus loss freezes both bodies; reset restores riding and clears the ragdoll.
+
+These are proxy contacts, not triangle-perfect collisions or retail ragdoll tracks.
+Rider–bike contacts use frame/wheel proxies and currently push the rider only;
+limb self-collision is not simulated. Extreme airborne poses can intersect.
+
+## F6 hill showcase
+
+Press **F6** to start an automatic, repeating sequence:
+**Superman → backflip → frontflip → barrel roll → no hands + no feet →
+barspin + tailwhip → table → deliberately incomplete flip/crash**.
+Each run rolls from the summit, launches off the real ramp, shows its landing or
+crash for 2.5 seconds, then resets for the next run. The loop takes roughly
+100 seconds. It uses ordinary pedal, brake and bounded air-control inputs;
+there are no airborne teleports, direct orientation writes or collision exemptions.
+
+The camera takes a side/rear angle and centres the bike for the longer released
+poses; RMB orbit and zoom still work. Esc pauses the whole demonstration.
+R restarts its current run. F6 again returns control at the current position;
+1–4 stop the demo and return to the flat start. To ride the hill manually, start
+F6 and immediately turn it off.
+
+## Animation coverage
+
+`src/animation.rs` blends posture and independent hand/foot/bike trick layers at
+120 Hz; `src/scene.rs` solves both visible geometry and collision proxies.
+These are **authored poses inspired by observed retail names**, not decoded clips.
+
+| Layer | Implemented families |
+| --- | --- |
+| Riding | Idle, seated pedaling, standing sprint, coast, braking, turning, wheelie/manual, nose manual |
+| Jump transitions | Hop preload/takeoff, air tuck/extension, impact-weighted landing compression/recovery |
+| Hands | One hand, no hands, tuck no-hand, barspin, tire grab, seat grab, toboggan |
+| Feet | One foot, no feet, can-can, no-foot can, Superman, tailwhip, nac-nac, Indian |
+| Bike | Whip, table, X-up, turndown, Euro table, invert, crankflip |
+| Rotations | Physical quaternion flips, barrel rolls and airborne yaw |
+
+Fluidity (tuned against retail reference video timings, not retail clips):
+- The bike is drawn from the last two fixed ticks (`BikeFrames`: joints lerp, rotations slerp,
+  wheel/crank angles blend the short way) at `Time<Fixed>::overstep_fraction`; the chase camera reads
+  the same interpolated root. Resets/teleports and discipline changes never blend.
+- Posture, trick weights, release, landing, lean, pedalling weight and steering/crank followers are
+  critically damped springs (no velocity steps). The drawn crank follows the physical one on a spring
+  and, freewheeling, settles level (outside pedal down in a corner).
+- Pedalling: pelvis rocks over the pushing pedal (more when standing) with the shoulders against it;
+  the ankle pitches with the stroke (toe down at the bottom, heel dropped coasting). The hip reach is
+  a soft minimum over both pedals, so legs never snap or fully straighten.
+- Cornering: the rider's pelvis goes outboard and the torso stays more upright than the bike; the inside
+  knee and elbow flare; the head stays level and near the bike centreline. Descents add an attack
+  crouch, terrain compression pushes the rider into it, and the torso lags the bike's acceleration.
+- Landing: contact to deepest compression about 0.25 s, then about 0.3 s more to recover (small
+  overshoot); the pelvis drops about 12-20 cm, knees reach about 80-100 deg flexion and elbows about
+  100 deg with the upper arms flared. The compression rises from rest on a spring, with no velocity kick.
+- Standing strokes rock the drawn bike (not the physics) about the tyre contact line, up to 3 deg, against
+  the pelvis sway; hands and feet follow the drawn grips and pedals.
+- Rider bone lengths (thigh, shin, arm, hip/shoulder width) are our own constants near the decoded retail
+  rider's. Pedalling cadence, knee range and pelvis sway are within the decoded retail ranges (see the
+  test probes); the torso still leans a few degrees more than the retail pedal clips.
+- Not done: hop preload is limited by the physical hop firing on the key press.
+
+Hand, foot and bike selections combine, with left/right variants. Barspin turns the
+front assembly, tailwhip swings the frame/rear assembly about the steering axis,
+and crankflip turns the cranks while feet release. Bone lengths are preserved;
+unreachable free-limb targets are projected into reach rather than stretching limbs.
+Extreme mixed poses can move attached hands slightly off the grips; the matrix
+currently bounds that gap to 10 cm and attached feet to 5 cm, versus 5 mm on normal
+riding poses. There is no rider/bike self-collision; extreme tricks can intersect.
+
+The HUD shows selected versus active layers and any priority override:
+- Tricks start only airborne, after the first 0.05 s.
+- New holds stop 0.45 s before predicted wheel contact; rider release/regrab and
+  bar/tail/crank completion prepare the landing. Short flights may have no safe trick window.
+- Barspin owns the bars and suppresses table, X-up and Euro table.
+- Invert, Euro table and crankflip force feet clear; an explicit foot trick
+  still determines their pose.
+- Bar/tail/crank animations finish a revolution or unwind before contact. Their
+  timing remains authored assistance. **Root flips/rolls are not completed for you**;
+  an incorrect attitude or unfinished physical rotation can crash.
+
+Observed but **not implemented as separate trick families**: Bikeflip, Briflip,
+HDflip, Grizzair, Cannonball and Tsunami. Retail walk-back, dismount, menu/taunt,
+crash and other opaque clip variants are not reproduced. Opposite-side procedural
+poses do not certify the retail `OPPO` tracks, and PS prefixes are not verified
+discipline bindings. Complete original-game animation playback still requires the
+track schemas, bone bindings and blend graph described under parity limits.
+
+## Retail asset tools
+
+These can build without the Bevy renderer using `--no-default-features`.
+
+```sh
+cargo run --locked --no-default-features --bin rider-assets -- inspect
+cargo run --locked --no-default-features --bin rider-assets -- find pedal
+cargo run --locked --no-default-features --bin rider-assets -- check ID07
+```
+
+The game directory defaults to the Flatpak Steam installation under `$HOME`.
+Override it with `RIDERS_REPUBLIC_DIR` or the final directory argument:
+
+```sh
+cargo run --locked --no-default-features --bin rider-assets -- inspect /path/to/RidersRepublic
+cargo run --locked --no-default-features --bin rider-assets -- find pedal /path/to/RidersRepublic
+cargo run --locked --no-default-features --bin rider-assets -- check pedal /path/to/RidersRepublic
+cargo run --locked --no-default-features --bin rider-assets -- extract /path/to/DataPC.forge RESOURCE_ID
+```
+
+`find` searches index names, case-insensitively for ASCII. `check` additionally
+decodes every matching entry and validates checksums, lengths and resource
+identities. No matches, unsupported formats and corrupt entries fail explicitly.
+IDs accept decimal or `0x`-prefixed hexadecimal.
+
+`extract` writes only to `.local/extracted/<hex-id>/`, refuses an existing output
+directory, and retains the stored container, decompressed metadata/files, and each
+native record/header/payload. It does **not** convert payloads into animation
+keyframes, meshes, or physics settings. Proprietary evidence/extracts and build
+outputs are ignored by Git. Original game files are opened read-only.
+
+## GamePort2Rust
+
+The existing sibling checkout is installed through `.tools/GamePort2Rust`; its
+already-installed REA/Ghidra/Java stack is reused. No global package or unrelated
+OMP configuration was changed during this integration.
+
+```sh
+bash scripts/gameport.sh install
+bash scripts/gameport.sh rea --help
+bash scripts/gameport.sh query /path/to/RidersRepublic.exe PROCEDURE
+```
+
+For another checkout, set `GAMEPORT2RUST_ROOT` when installing. GamePort2Rust is
+native reverse-engineering tooling, not an asset loader or Rust engine. This
+project supplies the Rust Forge/container reader; the toolkit supplied the static
+executable inspection. Its own query wrapper retains evidence in the toolkit's
+ignored `.local/re/` directory.
+
+## Local physics/showcase verification
+
+`cargo test --locked --bins` runs the gameplay/rig/physics/camera tests plus 3
+archive/container tests (86 + 3 at the realism pass; this section's revision passed 45).
+Physical checks cover safe flat/slope landings for all disciplines, nose/side/
+inverted/slipping failures, hard impacts, detached support, free angular momentum,
+completed versus incomplete flips, ignored post-crash controls, reset and bounded
+proxy penetration at supported time steps. A posed table crashes where the same
+upright bike can land. The floor grid is checked against collision height.
+Ground-contact checks cover low-speed pedal/coast/brake transitions and slope holds
+for all four profiles. Ragdoll checks cover detached articulation, bounded bones,
+terrain clearance, settling/reset and penetration repair without kinetic-energy injection.
+
+The 4,608-scenario hand × foot × bike × discipline × side matrix remains.
+Its root-flip assumptions were removed: full rotations and the eight-case demo
+now have physical integration checks, including seven successful runs followed
+by a deliberate crash and a loop reset.
+
+The actual app ran locally on a private Xvfb display using RTX 3090 Vulkan.
+All four bikes pedaled, coasted, braked and settled without measured resting
+height drift, pitch rate or speed in the sampled state captures.
+An impossible short-hop flip detached the ragdoll; its joints settled and slept,
+pause froze both bodies, and R restored riding. The full F6 loop retained seven
+safe landings and activated the ragdoll for its deliberate incomplete-flip crash.
+The high-impact check also caught and corrected an initial penetration-induced
+launch; that failed observation is preserved separately from final evidence.
+Screenshots, input states, regression/build output and final recordings are in
+`.local/verification/ragdoll-contact/`; no owner's-desktop input was injected.
+
+Earlier physical-flip/hill evidence, before the articulated ragdoll and contact
+stability fix, remains in `.local/verification/crash-showcase/`.
+
+Earlier authored-animation evidence (28 tests at that revision, including the
+now-removed visual flip layer) remains in `.local/verification/disciplines/`.
+
+Earlier camera/white-arena verification (21 tests at that revision) remains in
+`.local/verification/showcase/`: orbit/zoom, manual/automatic recenter, reset,
+natural ramp jumps, and a controlled 14 m camera arm shortened to about 8.75 m.
+Earlier bike-only evidence remains in `.local/verification/bevy/`.
+
+The preserved `rider-assets` binary was previously run locally against the actual
+installed game: all six indexes loaded (1,301,684 entries), and 23 pedaling
+containers decoded without failures. Original files were opened read-only;
+whole-source-file before/after hashes were not taken.
+
+This revision also read the actual indexes for ID07 names (1,502 animation-tagged
+entries) and checked all 275 `AIR_UNGRAB`-named containers with zero decode failures.
+The name census and raw checks are in `.local/verification/disciplines/`.
+Container integrity is not track decoding, and index names alone do not establish
+which discipline uses a clip.
+
+Use `cargo test --locked --bins` for the regression checks.
+**AISandbox is prohibited for this project** by [AGENTS.md](AGENTS.md);
+build, test and debug locally.
+
+## Prior retail extraction verification
+
+The earlier, pre-rule sandbox verification used exact index bytes from all six installed archives and
+exact selected retail payloads, with SHA-256 checks for every copied segment.
+The verification files were sparse: **unsampled payloads were absent**, so this is
+not a claim that every resource in the installation was decoded.
+
+| Check | Observed result |
+| --- | --- |
+| Forge v27 indexes | 6 archives, 1,301,684 entries |
+| Animation-tagged index entries | 9,111 across all archives; not deduplicated |
+| Selected ID07-named resource containers | 1,505 decoded, zero failures |
+| Pedaling animation containers | 23 decoded, zero failures |
+| Selected bike puppet skeleton container | 1 decoded, zero failures |
+| Selected bike air-trick settings containers | 4 decoded, zero failures |
+| Selected bike collision/physics-property containers | 2 decoded, zero failures |
+| Parser regression checks | 3 passed |
+| Existing-output, empty-search and malformed-ID rejection | Passed |
+| Copied retail index/payload bytes after checks | Unchanged |
+| Installed toolkit command dispatch | Query and REA help succeeded with Node 24 |
+
+The observed data format uses two v2/algorithm-5 Zstandard block streams and
+seed-zero Adler-32 checksums. Decode size is bounded to 256 MiB per container;
+Zstandard window size is bounded to 8 MiB. Sidecars, other codecs/versions and
+unrecognized record layouts are rejected, not silently skipped. Archives are
+examined separately; original-game patch precedence is not reproduced.
+
+Evidence and selected extracted resources are in `.local/verification/`,
+`.local/extracted/`, `.local/retail-samples.zip` and `.local/re/`. Run the permanent
+parser checks alone with `cargo test --locked --no-default-features --bin rider-assets`.
+
+## Original-game parity limits
+
+GamePort2Rust's shipped Ghidra bridge successfully imported the selected executable,
+identified its native mappings, and read its entry-point bytes without executing
+it. The executable has no on-disk bytes in its original code/data sections and
+stores bytes in packing sections. Exposed strings/exports did not yield a bike
+physics or animation function contract. That observation does not prove that such
+code does not exist after runtime loading.
+
+Animation, skeleton and bike settings **containers are recoverable**. Their inner
+Riders-specific track/object schemas, rig bindings, units, blend/IK transitions,
+and bike simulation algorithms are not established. Public older-Anvil animation
+documentation does not certify compatibility with Riders Republic. The Bevy
+model and procedural animation do not claim to reproduce those opaque schemas.
+
+A faithful full port needs recoverable bike runtime contracts (or a documented,
+measurable behavior reference), verified Riders-specific skeletal/animation
+layouts, and an original-game parity reference. No retail executable, anti-cheat
+service, runtime attachment or protection-bypass operation was run.
+
+## Format references
+
+Independent reader implementation informed by these public descriptions, then
+checked against actual Riders Republic index/container bytes. Cross-title resource
+semantics remain unverified.
+
+- [Forge v27 layout](https://github.com/dataterminals/grb-modding-knowledgebase/blob/9f51464a47011f1bf7c006ce7b3277ef26622c29/docs/02-forge-file-format.md)
+- [Resource records and extended headers](https://github.com/dataterminals/grb-modding-knowledgebase/blob/9f51464a47011f1bf7c006ce7b3277ef26622c29/docs/03-data-and-resources.md)
+- [Older Anvil animation support limits](https://github.com/Kamzik123/AnvilToolkit-Resources/wiki/Creating-Custom-Animations)
