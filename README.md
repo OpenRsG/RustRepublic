@@ -7,7 +7,7 @@ desktop, or in the browser over WebGPU.
 | Bike freestyle | Ski freestyle |
 | :---: | :---: |
 | ![Bike: Superman, backflip, barrel roll, tailwhip](docs/media/bike-freestyle.gif) | ![Ski: 360 Mute, backflip Safety, 540 Japan, Daffy](docs/media/ski-freestyle.gif) |
-| [Full bike showcase loop (mp4, 100 s)](docs/media/bike-showcase.mp4) | [Full ski showcase loop (mp4, 90 s)](docs/media/ski-showcase.mp4) |
+| [Full bike showcase loop: 17 runs, 5 crashes (mp4, 3:39)](docs/media/bike-showcase.mp4) | [Full ski showcase loop: 14 runs, 5 crashes (mp4, 3:38)](docs/media/ski-showcase.mp4) |
 
 > [!IMPORTANT]
 > **No game code, and no game needed.** Everything in this repository was written from
