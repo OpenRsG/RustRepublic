@@ -175,6 +175,24 @@ Press **5** for a skier; **1–4** return to the bike. The code is in `src/ski/`
 
 Keys: W skate/pole, S plow/hockey stop, A/D carve, Shift tuck, Space jump, arrows flip/roll, E/T spin, Ctrl full flips, U picks the grab, B holds it, J/L picks the side, R resets.
 
+## Rendering
+
+- `src/body.rs`: each rider is one procedural mesh per material (top, bottom, skin, shoe,
+  glove) skinned to 17 bones, two weights per vertex. Every bone is aimed from its parent
+  point to its child point on the solved rig (minimal-arc twist for limbs; pelvis/shoulder,
+  heel/toe and head frames for torso, feet and head) and stretches to the rig's spacing,
+  so riding, interpolated frames, the get-up blend and the ragdoll all draw through it.
+  F2 hides it; helmet and goggles stay rigid parts.
+- `src/surface.rs`: a tileable 256×256 grain albedo + normal map built at startup with
+  hand-built mips, repeat sampler and 8× anisotropy; the floor has world-space UVs (5 m tile).
+- `src/tracks.rs`: 4096 quads in one mesh updated in place, one mark per 10 cm of grounded
+  travel (tyres and both skis), unlit and alpha-blended 2 cm above the terrain, fading over
+  45 s. Gaps, teleports over 2 m, R and sport switches break or clear them.
+- Camera: SMAA; SSAO on native builds only (WebGPU's 4 storage textures per stage are
+  fewer than it needs). `FrameTimeDiagnosticsPlugin` feeds the HUD fps line. On the
+  RTX 3090 / Xvfb setup this costs about 8% (59 → 55 fps, mostly SSAO); the WebGPU page
+  ran the showcases at 52–61 fps after the opt-level 3 build.
+
 ## Crashes and landing rules
 
 Touchdown is judged **before** the bump stop changes velocity or contact flags.

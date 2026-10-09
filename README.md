@@ -118,6 +118,10 @@ suspension, power, grip and look.
     rodeo Mute (lands switch), backflip Iron cross, 360 Spread eagle (slalom), switch 180 Tip.
     Crashes: sideways 270, under-rotated 720, under-rotated backflip, over-rotated backflip,
     incomplete front flip.
+- **Look:** one smooth skinned body per rider driven by the solved skeleton (and by the
+  ragdoll after a crash), procedural snow/dirt grain on the terrain, tyre and ski tracks
+  that fade over 45 s, SMAA anti-aliasing (plus ambient occlusion on the desktop build)
+  and an fps / frame-time line in the HUD.
 - **Debug views:** F1 skeleton overlay, F2 skeleton-only.
 
 ## Controls
