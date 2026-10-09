@@ -41,12 +41,17 @@ Serve `target/www` over HTTPS or `localhost`, for example with `tailscale serve`
 Safari. You need the `wasm32-unknown-unknown` target and
 `wasm-bindgen-cli 0.2.129`, the same version as in `Cargo.lock`.
 
-The page opens straight into the looping ski showcase. Phones are view-only: there are
-no on-screen buttons, so you watch the showcase and move the camera, but can't ride.
+The page opens straight into the looping ski showcase. A ☰ menu (top right) switches
+between ski and the four bikes, starts either showcase, picks tricks, and toggles pause,
+bones, mesh, key help, touch controls and fullscreen.
+- **Touch controls** (shown on touch screens): a left stick rides (pedal/push, brake,
+  steer), a right stick leans and flips, and buttons hold jump, sprint/tuck, flip,
+  trick/grab and both spins, plus wheelie and the manuals on a bike. Touching a control
+  during a showcase takes over. Reset and camera recenter sit next to the menu.
 - **Portrait:** the view widens instead of cropping the sides, and the camera looks down
   so the tall screen shows snow rather than sky.
 - **HUD:** the panels shrink, and the key help is hidden.
-- **Touch:** drag with one finger to orbit, pinch to zoom.
+- **Camera:** drag empty screen with one finger to orbit, pinch to zoom.
 
 ## What's in it
 
@@ -89,10 +94,15 @@ suspension, power, grip and look.
 - **Camera:** a chase camera follows your direction of travel rather than the spinning
   body. Its field of view widens with speed, and it lifts over terrain instead of
   clipping into it.
-- **F6 showcase:**
-  - **Bike:** Superman → backflip → frontflip → barrel roll → no hands + no feet →
-    barspin + tailwhip → table → a deliberate crash.
-  - **Ski:** 360 Mute → backflip Safety → 540 Japan → Daffy → an incomplete front flip.
+- **F6 showcase** (each loop takes about 3½ minutes):
+  - **Bike:** Superman, backflip, 360 X-up, frontflip, backflip Superman, barrel roll,
+    no hands + no feet, barspin + tailwhip, table, 360 tuck no-hander, frontflip
+    can-can, barrel roll no-hander. Crashes: nose dive, sideways landing, half barrel,
+    over-rotated backflip, incomplete flip.
+  - **Ski:** 360 Mute (slalom), backflip Safety, 540 Japan, frontflip Mute, Daffy,
+    rodeo Mute (lands switch), backflip Iron cross, 360 Spread eagle (slalom), switch 180 Tip.
+    Crashes: sideways 270, under-rotated 720, under-rotated backflip, over-rotated backflip,
+    incomplete front flip.
 - **Debug views:** F1 skeleton overlay, F2 skeleton-only.
 
 ## Controls

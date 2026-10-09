@@ -1,7 +1,9 @@
 //! Scripted ski showcase: summit runs flown with real controls only (no teleports mid-run, no pose
-//! writes, no forced landings). Each run rides the hill, takes the 7 m kicker, performs one trick
-//! with the air-control servos and lands; the last run is a deliberately incomplete front flip
-//! that crashes. The outcome is shown for a while, then the next run starts and the list loops.
+//! writes, no forced landings). Each run rides the hill, takes the 7 m kicker, flies its spins,
+//! flips (both at once for the rodeo, which lands switch) and grab with the air-control servos and lands. Crash runs
+//! stop the rotation at a bad attitude (sideways, short of a 720, short of or past a backflip,
+//! short of a front flip) and let the landing rules decide. The outcome is shown for a while, then the next run
+//! starts and the list loops.
 
 use bevy::prelude::Resource;
 use std::f32::consts::{PI, TAU};
@@ -33,51 +35,108 @@ struct Run {
     expect_crash: bool,
 }
 
-const RUNS: [Run; 5] = [
+const STRAIGHT: Run = Run {
+    name: "",
+    slalom: false,
+    spin: 0.0,
+    flip: 0.0,
+    grab: Grab::None,
+    side: 1.0,
+    expect_crash: false,
+};
+
+const RUNS: [Run; 14] = [
     Run {
         name: "Slalom, 360 Mute",
         slalom: true,
         spin: TAU,
-        flip: 0.0,
         grab: Grab::Mute,
-        side: 1.0,
-        expect_crash: false,
+        ..STRAIGHT
     },
     Run {
         name: "Backflip Safety",
-        slalom: false,
-        spin: 0.0,
         flip: TAU,
         grab: Grab::Safety,
         side: -1.0,
-        expect_crash: false,
+        ..STRAIGHT
     },
     Run {
         name: "540 Japan",
-        slalom: false,
         spin: -3.0 * PI,
-        flip: 0.0,
         grab: Grab::Japan,
-        side: 1.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Frontflip Mute",
+        flip: -TAU,
+        grab: Grab::Mute,
+        side: -1.0,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Sideways 270 - crash",
+        spin: -1.5 * PI,
+        expect_crash: true,
+        ..STRAIGHT
     },
     Run {
         name: "Daffy",
-        slalom: false,
-        spin: 0.0,
-        flip: 0.0,
         grab: Grab::Daffy,
         side: -1.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Under-rotated 720 - crash",
+        spin: 3.75 * PI,
+        grab: Grab::TruckDriver,
+        expect_crash: true,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Rodeo Mute",
+        spin: TAU,
+        flip: TAU,
+        grab: Grab::Mute,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Under-rotated backflip - crash",
+        flip: 1.8,
+        expect_crash: true,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Backflip Iron cross",
+        flip: TAU,
+        grab: Grab::IronCross,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Slalom, 360 Spread eagle",
+        slalom: true,
+        spin: -TAU,
+        grab: Grab::SpreadEagle,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Switch 180 Tip",
+        spin: PI,
+        grab: Grab::Tip,
+        side: -1.0,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Over-rotated backflip - crash",
+        flip: 1.3 * TAU,
+        expect_crash: true,
+        ..STRAIGHT
     },
     Run {
         name: "Incomplete front flip",
-        slalom: false,
-        spin: 0.0,
         flip: -2.4,
-        grab: Grab::None,
         side: 1.0,
         expect_crash: true,
+        ..STRAIGHT
     },
 ];
 
@@ -267,7 +326,7 @@ mod tests {
         let mut spin = [0.0_f32; RUNS.len()];
         let mut flip = [0.0_f32; RUNS.len()];
         let mut outcomes = [None; RUNS.len()];
-        for _ in 0..(400.0 / dt) as usize {
+        for _ in 0..(1200.0 / dt) as usize {
             let index = demo.index;
             let mut c = SkiControls::default();
             demo.drive(&mut s, &mut c, dt);

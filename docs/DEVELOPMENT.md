@@ -128,11 +128,22 @@ Needs the `wasm32-unknown-unknown` standard library (Arch: `rust-wasm`) and
 (`cargo install --locked wasm-bindgen-cli --version 0.2.129`). It uses the `web` profile
 (size-optimised, stripped). The page needs WebGPU, so serve it over HTTPS or `localhost`.
 It opens in ski mode with the F6 showcase looping and keeps running without focus;
-click the canvas to use the keys. Browsers may keep F-keys, so reload to restart the
-showcase. WebGL is not built. On portrait screens the camera keeps a 4:3 horizontal field of
-view (vertical FOV up to 100 degrees, `hor_plus` in `src/game.rs`) and tilts down; the HUD
-scales with `UiScale`, key help hides on turning portrait, one finger orbits and two pinch-zoom.
+click the canvas to use the keys. WebGL is not built. On portrait screens the camera keeps a
+4:3 horizontal field of view (vertical FOV up to 100 degrees, `hor_plus` in `src/game.rs`)
+and tilts down; the HUD scales with `UiScale`, key help hides on turning portrait (and on
+load on a landscape touch screen), one finger orbits and two pinch-zoom.
 The web build starts with the skeleton overlay off.
+
+`web/index.html` adds a menu and touch controls on top of the canvas. Both only dispatch
+synthetic `KeyboardEvent`s (`code` = the game's key) to the canvas, so the game sees ordinary
+keys and needs no web-specific input code. The ride stick maps to W/A/S/D and the lean stick
+to the arrows, eight-way like a d-pad (diagonals hold two keys); buttons hold their key while
+touched, with pointer capture so a sliding thumb doesn't drop it. Taps are spaced by
+animation frames rather than milliseconds, so slow phones still see each press on its own
+frame. `pointerdown` is cancelled so the canvas keeps focus (Bevy releases held keys on
+blur). The page mirrors the mode keys (1–5, F6) to label the menu; touching any control
+during a showcase sends F6 first to take over. The browser build autostarts the ski showcase
+on the first frame only, so switching away before it runs doesn't start it later.
 
 To share it on a tailnet, `sudo tailscale serve --bg --https=8443 <repo>/target/www`
 serves it at `https://<host>.<tailnet>.ts.net:8443/`. Rebuilding updates it in place.
@@ -150,7 +161,7 @@ Press **5** for a skier; **1–4** return to the bike. The code is in `src/ski/`
 - Crashes hand over to an articulated rigid-body ragdoll (`ragdoll.rs`, extended position-based dynamics at 2,400 substeps a second). Twenty segments with anthropometric masses and inertias (pelvis, abdomen, thorax, head, upper arms, forearms, hands, thighs, shins, boots, skis, poles) are pinned at the skeleton's joints. Every joint has an anatomical range measured from the upright stance, for example hip flexion 120 / extension 20 / abduction 45 / adduction 30 degrees, knee 0-150 degrees with 5 degrees of side play, elbow 0-150, shoulder flexion to about 170 and abduction to 180 about a raised-arm centre, ski-boot ankle 10 back / 40 forward. Past the end of range the joint gives like a stiff spring (ligaments, the boot shell) and stops dead 6 degrees further. The torque holding each joint at its limit, averaged over 20 ms, is compared per axis with the joint's strength (knee: 250 N m hyperextension, 150 sideways, 100 twisting; neck 225/180/120; wrist 110/90/70 and so on). A joint over its strength breaks and its range opens by 50 degrees; it stays attached and still collides. The bindings release the skis forward (heel) or in twist (toe), never sideways, usually before the legs give in moderate falls, at about 2.5 times DIN 7 torques because the limp body levers the boots harder than a skier's working legs. Strengths are tuned so falling over, a stiff 2 m drop or a 1 m drop with forward speed break nothing, while 12-22 m/s tumbles and dives release skis and break joints. The HUD lists what broke and whether a ski came off.
 - Every pair of segments that is not jointed collides as rendered-size capsules, broken or not, so arms stay out of the torso, head and legs, legs out of each other, skis out of boots and poles out of limbs to within a few millimetres. Only the grip section of a pole may lie along its own wrist, and the upper arm collides from just below the shoulder, which sits inside the chest slab. Skis glide along their length (friction 0.05) and bite across it (0.8); anything lying in the snow has rolling resistance. Out-of-range or overlapping animated poses are eased into range at 230 degrees a second instead of snapped. The tests throw the skier down the hill straight, flipping, cartwheeling and corkscrewing, dive it head-first at 22 m/s, drop it and run the F6 crash, checking every tick that nothing sinks into the snow, no bone stretches, no two segments overlap by more than 5 mm (1 cm for a pole on a ski) and no joint passes its hard stop by more than a few degrees.
 - Hard impacts: closing speed into the snow above 14 m/s (a 10 m drop onto flat snow) always crashes, and above 0.65 of that a touchdown that also uses more than half of its tilt, crossed-ski or spin limit crashes too. The crash hands the ragdoll the pre-impact momentum (seed within a few percent of the velocity before the step). The fists hold the poles until the pull on a grip passes 900 N (low-passed over 20 ms): gentle drops and topples keep both poles, a head-first dive or a 20 m/s flat landing tears at least one away, after which the loose pole tumbles and collides like any other segment. The HUD adds "dropped a pole / dropped both poles" after the bindings. Poles are single rigid shafts and do not bend or snap.
-- F6 in ski mode loops: slalom + 360 Mute, backflip Safety, 540 Japan (lands switch), Daffy, then a deliberately incomplete front flip that crashes.
+- F6 in ski mode loops 14 runs (about 3½ minutes): slalom 360 Mute, backflip Safety, 540 Japan (lands switch), frontflip Mute, Daffy, rodeo Mute (a 360 spin and a backflip flown together, which lands switch), backflip Iron cross, slalom 360 Spread eagle, switch 180 Tip, and five crashes: sideways 270, a 720 stopped at 675 degrees, an under-rotated backflip (about 100 degrees, onto the back), an over-rotated backflip (1.3 turns) and an incomplete front flip. A full 720 doesn't fit in the kicker's air time, so it is shown as the crash it would be.
 
 Keys: W skate/pole, S plow/hockey stop, A/D carve, Shift tuck, Space jump, arrows flip/roll, E/T spin, Ctrl full flips, U picks the grab, B holds it, J/L picks the side, R resets.
 
@@ -190,12 +201,16 @@ limb self-collision is not simulated. Extreme airborne poses can intersect.
 
 ## F6 hill showcase
 
-Press **F6** to start an automatic, repeating sequence:
-**Superman → backflip → frontflip → barrel roll → no hands + no feet →
-barspin + tailwhip → table → deliberately incomplete flip/crash**.
-Each run rolls from the summit without pedalling, launches off the real ramp, shows its
-landing or crash for 2.5 seconds, then resets for the next run. The loop takes roughly
-100 seconds. It uses ordinary brake and bounded air-control inputs;
+Press **F6** to start an automatic, repeating sequence of 17 runs:
+**Superman → backflip → 360 X-up → frontflip → backflip Superman → barrel roll →
+nose dive (crash) → no hands + no feet → barspin + tailwhip → sideways landing (crash) →
+table → 360 tuck no-hander → frontflip can-can → half barrel (crash) →
+barrel roll no-hander → over-rotated backflip, 1.3 turns (crash) → incomplete flip (crash)**.
+Spins use a yaw servo on the real E/T air-yaw input; combined runs hold their trick while
+the rotation servo flies the flip, roll or spin. Each run rolls from the summit without
+pedalling, launches off the real ramp, shows its landing or crash for 2.5 seconds, then
+resets for the next run. The loop takes about 3½ minutes. It uses ordinary brake and
+bounded air-control inputs;
 there are no airborne teleports, direct orientation writes or collision exemptions.
 
 The camera takes a side/rear angle and centres the bike for the longer released

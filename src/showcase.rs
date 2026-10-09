@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::bike::{
     Bike, BikeTrick, Controls, HILL_LIP_Z, HILL_START_Z, HILL_X, HandTrick, LegTrick,
@@ -18,83 +18,121 @@ struct Run {
     hand: HandTrick,
     feet: LegTrick,
     bike: BikeTrick,
+    /// Whole-body rotations to fly, rad, in the sign of the bike's body rates (+ pitch = back flip).
     pitch: f32,
     roll: f32,
+    yaw: f32,
     expect_crash: bool,
 }
 
-const RUNS: [Run; 8] = [
+const STRAIGHT: Run = Run {
+    name: "",
+    hand: HandTrick::None,
+    feet: LegTrick::None,
+    bike: BikeTrick::None,
+    pitch: 0.0,
+    roll: 0.0,
+    yaw: 0.0,
+    expect_crash: false,
+};
+
+const RUNS: [Run; 17] = [
     Run {
         name: "Superman",
-        hand: HandTrick::None,
         feet: LegTrick::Superman,
-        bike: BikeTrick::None,
-        pitch: 0.0,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
     },
     Run {
         name: "Backflip",
-        hand: HandTrick::None,
-        feet: LegTrick::None,
-        bike: BikeTrick::None,
         pitch: TAU,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "360 X-up",
+        yaw: TAU,
+        bike: BikeTrick::XUp,
+        ..STRAIGHT
     },
     Run {
         name: "Frontflip",
-        hand: HandTrick::None,
-        feet: LegTrick::None,
-        bike: BikeTrick::None,
         pitch: -TAU,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Backflip superman",
+        pitch: TAU,
+        feet: LegTrick::Superman,
+        ..STRAIGHT
     },
     Run {
         name: "Barrel roll",
-        hand: HandTrick::None,
-        feet: LegTrick::None,
-        bike: BikeTrick::None,
-        pitch: 0.0,
         roll: -TAU,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Nose dive - crash",
+        pitch: -1.2,
+        expect_crash: true,
+        ..STRAIGHT
     },
     Run {
         name: "No hands + no feet",
         hand: HandTrick::NoHand,
         feet: LegTrick::NoFoot,
-        bike: BikeTrick::None,
-        pitch: 0.0,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
     },
     Run {
         name: "Barspin + tailwhip",
         hand: HandTrick::Barspin,
         feet: LegTrick::Tailwhip,
-        bike: BikeTrick::None,
-        pitch: 0.0,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Sideways landing - crash",
+        yaw: FRAC_PI_2,
+        expect_crash: true,
+        ..STRAIGHT
     },
     Run {
         name: "Table",
-        hand: HandTrick::None,
-        feet: LegTrick::None,
         bike: BikeTrick::Table,
-        pitch: 0.0,
-        roll: 0.0,
-        expect_crash: false,
+        ..STRAIGHT
+    },
+    Run {
+        name: "360 tuck no-hander",
+        yaw: -TAU,
+        hand: HandTrick::TuckNoHand,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Frontflip can-can",
+        pitch: -TAU,
+        feet: LegTrick::CanCan,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Half barrel - crash",
+        roll: -PI,
+        expect_crash: true,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Barrel roll no-hander",
+        roll: -TAU,
+        hand: HandTrick::NoHand,
+        ..STRAIGHT
+    },
+    Run {
+        name: "Over-rotated backflip - crash",
+        pitch: 1.3 * TAU,
+        expect_crash: true,
+        ..STRAIGHT
     },
     Run {
         name: "Incomplete flip - crash",
-        hand: HandTrick::None,
-        feet: LegTrick::None,
-        bike: BikeTrick::None,
         pitch: PI,
-        roll: 0.0,
         expect_crash: true,
+        ..STRAIGHT
     },
 ];
 
@@ -108,6 +146,7 @@ pub(crate) struct Showcase {
     pub completed: u32,
     pub pitch_progress: f32,
     pub roll_progress: f32,
+    pub yaw_progress: f32,
     landing_heading: f32,
 }
 
@@ -122,6 +161,7 @@ impl Default for Showcase {
             completed: 0,
             pitch_progress: 0.0,
             roll_progress: 0.0,
+            yaw_progress: 0.0,
             landing_heading: 0.0,
         }
     }
@@ -139,6 +179,7 @@ impl Showcase {
         self.outcome = "";
         self.pitch_progress = bike.pitch;
         self.roll_progress = bike.roll;
+        self.yaw_progress = 0.0;
         info!(
             "SHOWCASE_EVENT case={} stage=approach run={}",
             self.name(),
@@ -155,6 +196,7 @@ impl Showcase {
         // Quaternion nose elevation folds at vertical; body angular rates do not.
         self.pitch_progress += bike.pitch_rate * dt;
         self.roll_progress += bike.roll_rate * dt;
+        self.yaw_progress += bike.yaw_rate * dt;
         let grounded = bike.grounded.iter().any(|&g| g);
         if bike.crash.is_some() && !matches!(self.outcome, "CRASH" | "UNEXPECTED CRASH") {
             self.stage = Stage::Outcome;
@@ -179,6 +221,7 @@ impl Showcase {
             self.elapsed = 0.0;
             self.pitch_progress = bike.pitch;
             self.roll_progress = bike.roll;
+            self.yaw_progress = 0.0;
             self.landing_heading = bike.yaw;
             info!(
                 "SHOWCASE_EVENT case={} stage=flight position={:?} velocity={:?}",
@@ -230,22 +273,27 @@ impl Showcase {
                 input.air_roll =
                     -((12.0 * (roll_target - self.roll_progress) - 4.0 * bike.roll_rate) / 24.0)
                         .clamp(-1.0, 1.0);
+                let gain = bike.discipline.profile().air_control;
+                if run.yaw != 0.0 {
+                    let accel = 12.0 * (run.yaw - self.yaw_progress) - 4.0 * bike.yaw_rate;
+                    input.air_yaw = (-accel / (12.0 * gain)).clamp(-1.0, 1.0);
+                }
                 if !run.expect_crash
-                    && (run.roll != 0.0 || run.pitch != 0.0)
+                    && (run.roll != 0.0 || run.pitch != 0.0 || run.yaw != 0.0)
                     && (run.pitch - self.pitch_progress).abs() < 0.8
                     && (run.roll - self.roll_progress).abs() < 0.8
+                    && (run.yaw - self.yaw_progress).abs() < 0.8
                 {
                     // Settle the actual attitude with rider torque after the revolution. Body-axis
                     // rotations do not commute; scalar turn counters alone cannot level a barrel.
                     let mut error = bike.orientation().conjugate()
-                        * Quat::from_rotation_y(self.landing_heading);
+                        * Quat::from_rotation_y(self.landing_heading + run.yaw);
                     if error.w < 0.0 {
                         error = -error;
                     }
                     let (axis, angle) = error.to_axis_angle();
                     let accel = axis * angle * 12.0
                         - Vec3::new(bike.pitch_rate, bike.yaw_rate, bike.roll_rate) * 4.0;
-                    let gain = bike.discipline.profile().air_control;
                     input.air_pitch = (accel.x / (22.0 * gain)).clamp(-1.0, 1.0);
                     input.air_yaw = (-accel.y / (12.0 * gain)).clamp(-1.0, 1.0);
                     input.air_roll = (-accel.z / (17.6 * gain)).clamp(-1.0, 1.0);
@@ -285,10 +333,12 @@ mod tests {
         let mut anim = AnimationState::default();
         demo.begin_run(&mut bike);
         let mut launched = [false; RUNS.len()];
-        let mut shown = [false; RUNS.len()];
+        let mut rotated = [false; RUNS.len()];
+        let mut reached = [[false; 3]; RUNS.len()];
+        let mut posed = [false; RUNS.len()];
         let mut outcomes = [None; RUNS.len()];
         let mut details = [None; RUNS.len()];
-        for _ in 0..(200.0 / dt) as usize {
+        for _ in 0..(600.0 / dt) as usize {
             let index = demo.index;
             let mut c = Controls::default();
             if demo.drive(&mut bike, &mut c, dt) {
@@ -302,15 +352,21 @@ mod tests {
             if demo.stage == Stage::Flight {
                 launched[index] = true;
                 let run = RUNS[index];
-                shown[index] |= if run.pitch != 0.0 {
-                    demo.pitch_progress.abs() > if run.expect_crash { 2.5 } else { 5.8 }
-                } else if run.roll != 0.0 {
-                    demo.roll_progress.abs() > 5.8
-                } else {
-                    (run.hand == HandTrick::None || anim.hand == run.hand)
-                        && (run.feet == LegTrick::None || anim.leg == run.feet)
-                        && (run.bike == BikeTrick::None || anim.bike == run.bike)
-                };
+                // Each rotation is flown to within 0.6 rad, and every requested trick shows.
+                rotated[index] = [
+                    (run.pitch, demo.pitch_progress),
+                    (run.roll, demo.roll_progress),
+                    (run.yaw, demo.yaw_progress),
+                ]
+                .iter()
+                .zip(&mut reached[index])
+                .fold(true, |all, (&(target, got), hit)| {
+                    *hit |= (got - target).abs() < 0.6;
+                    all && *hit
+                });
+                posed[index] |= (run.hand == HandTrick::None || anim.hand == run.hand)
+                    && (run.feet == LegTrick::None || anim.leg == run.feet)
+                    && (run.bike == BikeTrick::None || anim.bike == run.bike);
             }
             if demo.stage == Stage::Outcome {
                 outcomes[index] = Some(bike.crash.is_some());
@@ -329,7 +385,8 @@ mod tests {
         assert_eq!(demo.completed, RUNS.len() as u32, "demo did not loop");
         for (index, run) in RUNS.iter().enumerate() {
             assert!(launched[index], "{} never launched", run.name);
-            assert!(shown[index], "{} animation/rotation not shown", run.name);
+            assert!(rotated[index], "{} rotation not flown", run.name);
+            assert!(posed[index], "{} trick not shown", run.name);
             assert_eq!(
                 outcomes[index],
                 Some(run.expect_crash),
