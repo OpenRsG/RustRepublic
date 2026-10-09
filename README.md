@@ -41,7 +41,7 @@ Serve `target/www` over HTTPS or `localhost`, for example with `tailscale serve`
 Safari. You need the `wasm32-unknown-unknown` target and
 `wasm-bindgen-cli 0.2.129`, the same version as in `Cargo.lock`. The build is optimized
 for speed; `wasm-opt` (binaryen) runs when found on `PATH` or under `.tools/binaryen/`, and
-a gzipped copy (about 8 MB) is written next to the wasm. The page downloads that copy and
+a gzipped copy (about 8.5 MB) is written next to the wasm. The page downloads that copy and
 unpacks it in the browser, with a progress bar, so no server compression is needed.
 
 The page opens straight into the looping ski showcase. A ☰ menu (top right) switches

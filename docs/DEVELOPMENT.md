@@ -125,14 +125,14 @@ with momentum and ordinary collision tests—not independent visual layers.
 ### Browser (WebGPU)
 
 ```sh
-scripts/web.sh   # writes target/www: index.html, JS glue, wasm and a gzipped copy (~8 MB)
+scripts/web.sh   # writes target/www: index.html, JS glue, wasm and a gzipped copy (~8.5 MB)
 ```
 
 Needs the `wasm32-unknown-unknown` standard library (Arch: `rust-wasm`) and
 `wasm-bindgen-cli` at the `wasm-bindgen` version in `Cargo.lock`
 (`cargo install --locked wasm-bindgen-cli --version 0.2.129`). It uses the `web` profile
 (opt-level 3, thin LTO, stripped): the physics runs at full speed and gzip keeps the
-download near 8 MB. `wasm-opt -O3` runs when binaryen is on `PATH` or unpacked under
+download near 8.5 MB. `wasm-opt -O3` runs when binaryen is on `PATH` or unpacked under
 `.tools/binaryen/`. The page fetches `rider-rep-rust_bg.wasm.gz` and unpacks it with
 `DecompressionStream` while a progress bar shows the stage and bytes, falling back to the
 plain wasm without that API. It also resumes the sound's `AudioContext` on the first

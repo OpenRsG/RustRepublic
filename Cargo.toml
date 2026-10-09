@@ -44,7 +44,7 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Browser bundle (scripts/web.sh): built for speed; the page downloads a gzipped copy (~8 MB).
+# Browser bundle (scripts/web.sh): built for speed; the page downloads a gzipped copy (~8.5 MB).
 [profile.web]
 inherits = "release"
 opt-level = 3
