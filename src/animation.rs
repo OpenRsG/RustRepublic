@@ -34,6 +34,7 @@ use crate::bike::{
     Bike, BikeTrick, Controls, HandTrick, LegTrick, SUSPENSION_REST, WHEEL_RADIUS, WHEELBASE,
     terrain_height,
 };
+use crate::scene::smooth01;
 
 const GRAVITY: f32 = 9.81;
 const MAX_DT: f32 = 1.0 / 15.0;
@@ -79,6 +80,20 @@ const SURGE_GAIN: f32 = 0.03;
 /// Suspension compression of the settled bike, m.
 const SAG_REST: f32 = 0.05;
 const TAKEOFF_T: f32 = 0.16;
+/// Time constant of the low-passed ground acceleration that tells climbing speed from top speed, s.
+const ACCEL_LP: f32 = 0.4;
+
+/// Deterministic per-landing jitter in -1..1, from a hash of the landing count and `salt`, so no
+/// two landings are absorbed alike but replays and tests stay exact.
+pub(crate) fn jitter(count: u32, salt: u32) -> f32 {
+    let mut x = count.wrapping_mul(0x9E37_79B9) ^ salt.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    x as f32 / u32::MAX as f32 * 2.0 - 1.0
+}
 
 // Free-pose kinds. Public tricks first, then poses forced by a bike trick.
 pub(crate) const HAND_KINDS: usize = 7;
@@ -315,6 +330,8 @@ pub(crate) struct Input {
     pub pitch_rate: f32,
     pub yaw_rate: f32,
     pub roll_rate: f32,
+    /// Pitch relative to the ground under the bike, rad (+ nose up).
+    pub ground_pitch: f32,
 }
 
 impl Input {
@@ -337,6 +354,13 @@ impl Input {
             pitch_rate: b.pitch_rate,
             yaw_rate: b.yaw_rate,
             roll_rate: b.roll_rate,
+            ground_pitch: {
+                let (s, c) = b.yaw.sin_cos();
+                let (x, z, d) = (b.position.x, b.position.z, 0.5);
+                let rise =
+                    terrain_height(x - s * d, z - c * d) - terrain_height(x + s * d, z + c * d);
+                b.pitch - (rise / (2.0 * d)).atan()
+            },
         }
     }
 }
@@ -383,6 +407,12 @@ pub(crate) struct Body {
     pub land: f32,
     /// Air body English `[throw, twist, drop, tuck]`, see [`AnimationState::english`].
     pub english: [f32; 4],
+    /// 0..1 how hard the rider is driving the pedals; see [`AnimationState::effort`].
+    pub effort: f32,
+    /// 0..1 spun out at top speed in a sprint: low and forward.
+    pub top: f32,
+    /// Landing jolt `[side, fore, twist]`, see [`AnimationState::jolt`].
+    pub jolt: [f32; 3],
 }
 
 /// Bike-assembly motion relative to the rider, as angles (see `scene::rig` for the geometry).
@@ -439,6 +469,9 @@ struct Rates {
     crank: f32,
     steer: f32,
     english: [f32; 4],
+    effort: f32,
+    top: f32,
+    jolt: [f32; 3],
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -473,6 +506,18 @@ pub(crate) struct AnimationState {
     /// back (+, backflip) or over the bars (-). Twist: shoulders and head leading a spin (+ left).
     /// Drop: shoulder dropped into a barrel roll (+ left). Tuck: 0..1 bike pulled in to rotate.
     pub english: [f32; 4],
+    /// 0..1 how hard the rider drives the pedals: sprinting, or pedalling while speed climbs.
+    pub effort: f32,
+    /// 0..1 spun out at top speed in a sprint.
+    pub top: f32,
+    accel_lp: f32,
+    /// Landing jolt, -1..1 each, scaled by the impact: `side` throws the body to the low side of
+    /// a leaned touchdown (+ left), `fore` over the bars (+) or back as the rear wheel lands first,
+    /// `twist` turns the shoulders (+ left). Set from the landing's direction plus a per-landing
+    /// jitter, held while the landing compresses, then released on a spring.
+    pub jolt: [f32; 3],
+    jolt_hit: [f32; 3],
+    landings: u32,
     /// Drawn (spring-followed, unwrapped) crank angle and bar angle; `None` before the first
     /// update, when the bike's own are used.
     crank_un: f32,
@@ -527,6 +572,12 @@ impl Default for AnimationState {
             pump: 0.0,
             surge: 0.0,
             english: [0.0; 4],
+            effort: 0.0,
+            top: 0.0,
+            accel_lp: 0.0,
+            jolt: [0.0; 3],
+            jolt_hit: [0.0; 3],
+            landings: 0,
             crank_un: 0.0,
             crank_vis: 0.0,
             prev_crank: None,
@@ -624,6 +675,9 @@ impl AnimationState {
             surge: self.surge,
             sag: self.pump,
             english: self.english,
+            effort: self.effort,
+            top: self.top,
+            jolt: self.jolt,
             crank: self.prev_crank.map(|_| self.crank_vis),
             steer: self.steer_vis,
             land: self.land.clamp(0.0, 1.0),
@@ -674,11 +728,22 @@ impl AnimationState {
             }
         } else if self.aloft {
             self.aloft = false;
-            let hit = self.impact.max((-i.vy / 8.0).clamp(0.0, 1.2));
+            self.landings = self.landings.wrapping_add(1);
+            let n = self.landings;
+            let hit = self.impact.max((-i.vy / 8.0).clamp(0.0, 1.2)) * (1.0 + 0.15 * jitter(n, 1));
             self.land_hit = hit;
             self.land_v = 0.0;
             self.since_land = 0.0;
             self.impact = 0.0;
+            // The body keeps going the way the landing throws it: to the low side of a leaned
+            // touchdown, back as the rear wheel lands first, over the bars on a nose-first one
+            // (or when still rotating forward), never twice the same.
+            let fore = -i.ground_pitch / 0.35 - i.pitch_rate / 4.0;
+            self.jolt_hit = [
+                (i.roll / 0.35 + 0.35 * jitter(n, 2)).clamp(-1.0, 1.0) * hit,
+                (fore + 0.3 * jitter(n, 3)).clamp(-1.0, 1.0) * hit,
+                (0.1 * i.yaw_rate + 0.5 * jitter(n, 4)).clamp(-1.0, 1.0) * hit,
+            ];
         }
         self.since_land = (self.since_land + dt).min(10.0);
         // Contact -> deepest compression over LAND_HOLD, then a slower recovery.
@@ -688,6 +753,16 @@ impl AnimationState {
             (0.0, LAND_OUT)
         };
         spring(&mut self.land, &mut self.land_v, target, omega, dt);
+        let held = (self.since_land < LAND_HOLD) as u8 as f32;
+        for k in 0..3 {
+            spring(
+                &mut self.jolt[k],
+                &mut self.rate.jolt[k],
+                self.jolt_hit[k] * held,
+                omega,
+                dt,
+            );
+        }
 
         if self.layers_idle() {
             self.side = if c.trick_side < 0.0 { -1.0 } else { 1.0 };
@@ -951,6 +1026,11 @@ impl AnimationState {
             attack = ((i.speed - 4.0) / 6.0).clamp(0.0, 1.0) * ride * (!pedaling) as u8 as f32;
             crouch += 0.3 * attack;
             back += 0.2 * attack;
+            // Driving hard the rider gets low and forward over the bars; spun out at top speed
+            // they sit lower still, chest down, out of the wind.
+            crouch += 0.3 * self.effort + 0.5 * self.top;
+            back -= 0.25 * self.effort + 0.3 * self.top;
+            stand -= 0.45 * self.top;
             lateral = 0.0;
             if c.hop {
                 stand = 0.0;
@@ -1029,6 +1109,25 @@ impl AnimationState {
             - 2.0 * SURGE_ZETA * SURGE_OMEGA * *v)
             * dt;
         *x += *v * dt;
+        // Effort: a rider driving the bike hard (sprinting, or pedalling while the speed still
+        // climbs) throws it from side to side under them and pulls on the bars. Once the speed
+        // stops climbing in a sprint the rider is spun out at top speed and drops low and
+        // forward, spinning rather than stomping.
+        self.accel_lp += (accel - self.accel_lp) * (dt / ACCEL_LP).min(1.0);
+        let driving = (grounded && pedaling && moving) as u8 as f32;
+        let top = driving
+            * sprint as u8 as f32
+            * smooth01(6.0, 9.0, i.speed)
+            * (1.0 - smooth01(0.3, 1.2, self.accel_lp));
+        let climbing = smooth01(0.2, 1.5, self.accel_lp);
+        let effort = driving
+            * if sprint {
+                1.0 - 0.6 * top
+            } else {
+                0.4 * climbing
+            };
+        spring(&mut self.effort, &mut self.rate.effort, effort, 5.0, dt);
+        spring(&mut self.top, &mut self.rate.top, top, 3.0, dt);
         // The drawn crank follows the physical one on a spring (the bike's crank stops dead the
         // tick pedalling stops). Coasting, it settles level, or outside pedal down in a corner,
         // instead of wherever the last stroke left it.

@@ -222,7 +222,14 @@ const LAND_TILT_LIMIT: f32 = 0.96;
 const LAND_CROSS_LIMIT: f32 = 0.61;
 const LAND_CROSS_MIN_SPEED: f32 = 2.0;
 const LAND_SPIN_LIMIT: f32 = 6.0;
-const HARD_IMPACT_SPEED: f32 = 17.0;
+/// Closing speed along the surface normal that is always a crash, m/s: 14 m/s is a 10 m drop onto
+/// flat snow, more than legs and skis absorb. The demo's kicker landings close at 13.5 m/s on the
+/// sloped transition and stay safe.
+const HARD_IMPACT_SPEED: f32 = 14.0;
+/// A closing speed above this fraction of `HARD_IMPACT_SPEED` (a 4.2 m drop) crashes when the
+/// touchdown also uses more than `MIXED_LIMIT_USE` of its tilt, cross or spin limit.
+const MIXED_IMPACT: f32 = 0.65;
+const MIXED_LIMIT_USE: f32 = 0.5;
 const LAND_ABSORB_SPEED: f32 = 12.0;
 /// Leg compression rate per unit `impact / LAND_ABSORB_SPEED` at touchdown, 1/s; the leg spring
 /// then peaks near full compression about 0.09 s later for a 12 m/s closing speed.
@@ -896,9 +903,14 @@ impl Skier {
         self.impact = impact;
         self.last_spin = self.air_spin;
         self.last_flip = self.air_flip;
-        let reason = if impact > HARD_IMPACT_SPEED {
+        let used = (tilt / LAND_TILT_LIMIT)
+            .max(cross / LAND_CROSS_LIMIT)
+            .max(spin / LAND_SPIN_LIMIT);
+        let reason = if impact > HARD_IMPACT_SPEED
+            || (impact > HARD_IMPACT_SPEED * MIXED_IMPACT && used > MIXED_LIMIT_USE)
+        {
             Some(SkiCrashReason::HardImpact)
-        } else if tilt > LAND_TILT_LIMIT || cross > LAND_CROSS_LIMIT || spin > LAND_SPIN_LIMIT {
+        } else if used > 1.0 {
             Some(SkiCrashReason::BadLanding)
         } else {
             None
@@ -1173,6 +1185,30 @@ mod tests {
             s.grounded && (10.0..17.0).contains(&closing),
             "closing {closing}"
         );
+    }
+
+    #[test]
+    fn closing_speed_into_the_snow_crashes_graded_by_how_the_skis_land() {
+        // (closing speed m/s, tilt rad, expected hard impact)
+        for (impact, tilt, hard) in [
+            (13.5, 0.0, false),
+            (15.0, 0.0, true),
+            (9.8, 0.0, false),
+            (9.8, 0.6, true),
+            (8.5, 0.6, false),
+        ] {
+            let mut s = flat(8.0);
+            s.grounded = false;
+            s.position.y = 0.02;
+            s.velocity = Vec3::new(0.0, -impact, -8.0);
+            s.rotation = Quat::from_rotation_x(tilt);
+            s.step(&default_controls(), DT);
+            assert_eq!(
+                s.crash.map(|c| c.reason),
+                hard.then_some(SkiCrashReason::HardImpact),
+                "{impact} m/s tilted {tilt}"
+            );
+        }
     }
 
     #[test]

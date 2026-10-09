@@ -53,14 +53,17 @@ no on-screen buttons, so you watch the showcase and move the camera, but can't r
 **Bike**: four disciplines (Downhill, Road, Slopestyle, Freeride), each with its own
 suspension, power, grip and look.
 - **Physics:** a fixed 120 Hz two-wheel model with pedalling, sprinting, braking,
-  wheelies and manuals.
+  wheelies and manuals. Land a flip on one wheel and you have to balance it with the
+  arrows, or loop out or go over the bars.
 - **Rotations:** flips, barrel rolls and spins are the bike's actual momentum. There are
-  no canned rotations, so you can under-rotate and crash.
+  no canned rotations, so you can under-rotate and crash. The rider leads them with head,
+  shoulders and hips.
 - **Tricks:** hand, foot and bike tricks combine freely, with left/right variants.
   Superman, can-can, nac-nac, tailwhip, barspin, table, X-up, turndown, Euro table,
   invert, crankflip and more.
 - **Rider:** pedals with hip sway and ankle motion, and leans and flares the knee into
-  corners. The bike rocks under a sprint. Landings absorb through the arms and legs.
+  corners. A sprint throws the bike from side to side with the shoulders pulling on the
+  bars; at top speed the rider drops low. Landings absorb through the arms and legs.
 
 **Ski**:
 - **Riding:** carving with angulation and upper/lower-body separation, hockey stops,
@@ -72,11 +75,15 @@ suspension, power, grip and look.
 - **Landings:** wide-stance absorb and a short skid.
 - **Crashes:** a rigid-body skier with human joint ranges and self-collision that keeps
   limbs out of each other and the body to within a few millimetres. Joints break past
-  their strength, bindings release at high loads, and the HUD lists what broke.
+  their strength, bindings release and poles are torn from the fists at high loads, and
+  the HUD lists what broke.
 
 **Both**:
-- **Crashes:** a bad landing, a hard impact or a body strike throws the rider into an
-  articulated ragdoll.
+- **Crashes:** a bad landing, a hard impact (too fast into the ground, or fast and
+  off-angle) or a body strike throws the rider into an articulated ragdoll that keeps
+  the momentum. A bike rider holds on until the wreck pulls harder than hands and feet can.
+- **Landings vary:** the body is thrown the way the touchdown came in, with a little
+  per-landing randomness.
 - **Smooth motion:** the rendered pose blends between physics ticks, and every animation
   blend is a critically damped spring, so nothing snaps.
 - **Camera:** a chase camera follows your direction of travel rather than the spinning
@@ -112,7 +119,7 @@ suspension, power, grip and look.
 | `src/showcase.rs` | Bike F6 script, driven through the normal controls |
 
 The terrain is a white arena: an analytic heightfield with three small jumps and a 32 m
-hill with a 7 m kicker. Run the checks with `cargo test --locked --bins`.
+hill with a 7 m kicker onto a landing table. Run the checks with `cargo test --locked --bins`.
 
 ## Limits
 

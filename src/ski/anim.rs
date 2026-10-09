@@ -2,6 +2,7 @@
 //! `rig::solve` turns these weights plus the `Skier` into a world-space `SkierPose`.
 
 use super::physics::{Grab, SkiControls, Skier};
+use crate::animation::jitter;
 use crate::bike::terrain_height;
 use bevy::prelude::*;
 
@@ -26,6 +27,13 @@ const PLANT_SPEED: f32 = 4.0;
 /// near neutral about half a second after the deepest point, as in the retail landing footage.
 const LAND_RECOVER: f32 = 5.0;
 const SKID_DECAY: f32 = 3.5;
+/// Seconds a touchdown's jolt is held before it is released, and its spring rates in and out.
+const JOLT_HOLD: f32 = 0.2;
+const JOLT_IN: f32 = 18.0;
+const JOLT_OUT: f32 = 9.0;
+/// Snow chatter: free hands' wander at `CHATTER_SPEED` m/s and above, m (peak, per axis).
+const CHATTER: f32 = 0.02;
+const CHATTER_SPEED: f32 = 18.0;
 
 /// Smoothed pose weights (0..1 unless noted). Read by `rig::solve`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,6 +76,16 @@ pub(super) struct Blend {
     pub skid_kick: f32,
     pub land_skid: f32,
     pub skid_side: f32,
+    /// Touchdown jolt `[side, fore, twist]`, -1..1 scaled by the impact: the body thrown sideways
+    /// the way the skis were sliding (+ right), forward over the tips (+) or back onto the tails,
+    /// and twisted (+ left). From the landing's direction plus a per-landing jitter.
+    pub jolt: [f32; 3],
+    pub jolt_hit: [f32; 3],
+    pub since_land: f32,
+    pub landings: u32,
+    /// Snow-chatter offset of each free hand (world, m) and its speed-driven amplitude.
+    pub chatter: [Vec3; 2],
+    pub chatter_w: f32,
     /// Torso fold: follows `land` a beat after the legs and rebounds with them.
     pub fold: f32,
     /// Chest yaw lagging the skis' turn rate, rad (+ left): the counter-rotation of a turn entry.
@@ -113,6 +131,8 @@ pub(super) struct Rates {
     land_skid: f32,
     counter: f32,
     plant_w: [f32; 2],
+    jolt: [f32; 3],
+    chatter_w: f32,
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -202,7 +222,9 @@ impl SkiAnimation {
             w.pop = w.preload.max(s.preload);
         }
         if !w.was_grounded && s.grounded {
-            w.land_kick = (s.impact / 10.0).clamp(0.0, 1.0);
+            w.landings = w.landings.wrapping_add(1);
+            let n = w.landings;
+            w.land_kick = (s.impact / 10.0 * (1.0 + 0.15 * jitter(n, 1))).clamp(0.0, 1.0);
             w.skid_kick = ((s.impact - 3.0) / 8.0).clamp(0.0, 1.0);
             w.skid_side = if s.last_spin.abs() > 1.0 {
                 s.last_spin.signum()
@@ -211,7 +233,32 @@ impl SkiAnimation {
             } else {
                 1.0
             };
+            // The body carries on the way the landing came in: sideways as far as the skis were
+            // sliding across their length, forward over landed-on tips or back onto the tails,
+            // and never twice the same; one arm flails more than the other.
+            let hit = w.land_kick;
+            let (right, tips) = (s.rotation * Vec3::X, s.rotation * Vec3::NEG_Z);
+            let e = 0.3;
+            let (x, z) = (s.position.x, s.position.z);
+            let normal = Vec3::new(
+                terrain_height(x - e, z) - terrain_height(x + e, z),
+                2.0 * e,
+                terrain_height(x, z - e) - terrain_height(x, z + e),
+            )
+            .normalize();
+            let slide = s.velocity.dot(right) / speed.max(4.0);
+            w.jolt_hit = [
+                (2.0 * slide + 0.35 * jitter(n, 2)).clamp(-1.0, 1.0) * hit,
+                (-4.0 * tips.dot(normal) + 0.3 + 0.3 * jitter(n, 3)).clamp(-1.0, 1.0) * hit,
+                (0.5 * jitter(n, 4)).clamp(-1.0, 1.0) * hit,
+            ];
+            w.since_land = 0.0;
+            for h in 0..2 {
+                let flail = Vec3::new(jitter(n, 5 + h as u32), 0.6, jitter(n, 7 + h as u32));
+                w.hand_vel[h] += flail * (0.6 * hit * (1.0 + jitter(n, 9 + h as u32)));
+            }
         }
+        w.since_land += dt;
         w.was_grounded = s.grounded;
         if s.grounded {
             w.pop = 0.0;
@@ -301,6 +348,20 @@ impl SkiAnimation {
         // The chest lags the skis' turn: counter-rotation builds at a turn entry and relaxes.
         let counter = (-COUNTER_LAG * s.angular_velocity.y).clamp(-0.35, 0.35) * ground;
         spring(&mut w.counter, &mut r.counter, counter, 8.0, dt);
+        let (held, omega) = if w.since_land < JOLT_HOLD {
+            (1.0, JOLT_IN)
+        } else {
+            (0.0, JOLT_OUT)
+        };
+        for k in 0..3 {
+            spring(
+                &mut w.jolt[k],
+                &mut r.jolt[k],
+                w.jolt_hit[k] * held,
+                omega,
+                dt,
+            );
+        }
 
         // Body English: shoulders and head lead a rotation and keep leading it, the hips and
         // skis follow. Before a pop the chest winds up against the coming spin.
@@ -330,7 +391,19 @@ impl SkiAnimation {
         // An impulse (pop, touchdown) reaches the hands over ~40 ms, not in one tick.
         w.dv += (dv - w.dv) * (1.0 - (-dt / 0.04).exp());
         let kick = (-HAND_GAIN * w.dv).clamp_length_max(HAND_KICK_MAX);
+        // Snow chatter at speed: the free hands (and the poles they hold) wander a little on
+        // incommensurate periods, different per hand, so the poles never ride exactly still or in
+        // step. Fore-aft and sideways only: a vertical shake would bounce trailing baskets off the
+        // snow.
+        let chatter = CHATTER * (speed / CHATTER_SPEED).min(1.0).powi(2) * ground;
+        spring(&mut w.chatter_w, &mut r.chatter_w, chatter, 3.0, dt);
         for (h, omega) in [11.0_f32, 13.5].into_iter().enumerate() {
+            let t = w.clock + 1.7 * h as f32;
+            w.chatter[h] = Vec3::new(
+                (2.3 * t).sin() + 0.5 * (3.9 * t + 1.0).sin(),
+                0.0,
+                (1.7 * t + 0.5).sin() + 0.4 * (3.1 * t + 2.5).sin(),
+            ) * w.chatter_w;
             let (x, v) = (w.hand[h], w.hand_vel[h]);
             w.hand_vel[h] = v + kick + (-omega * omega * x - 2.0 * HAND_ZETA * omega * v) * dt;
             w.hand[h] = (x + w.hand_vel[h] * dt).clamp_length_max(HAND_MAX);
@@ -551,6 +624,31 @@ mod tests {
         // Skier accelerates forward (-z): the hands lag behind (+z), then return to rest.
         assert!(trail > 0.03, "hands did not trail ({trail})");
         assert!(a.w.hand[0].length() < 1e-3 && a.w.hand[1].length() < 1e-3);
+    }
+
+    /// A touchdown sliding to the skier's right throws the body right, and repeated identical
+    /// landings are absorbed differently.
+    #[test]
+    fn landing_jolt_follows_the_slide_and_varies() {
+        let mut a = SkiAnimation::default();
+        let mut s = Skier::default();
+        let c = SkiControls::default();
+        let mut land = |a: &mut SkiAnimation| {
+            s.grounded = false;
+            a.update(&s, &c, 1.0 / 120.0);
+            (s.grounded, s.impact, s.velocity) = (true, 8.0, Vec3::new(3.0, 0.0, -10.0));
+            for _ in 0..12 {
+                a.update(&s, &c, 1.0 / 120.0);
+            }
+            a.w.jolt
+        };
+        let first = land(&mut a);
+        assert!(first[0] > 0.1, "sliding right: side jolt {first:?}");
+        let again = land(&mut a);
+        assert!(
+            first.iter().zip(again).any(|(p, q)| (p - q).abs() > 0.02),
+            "identical landings: {first:?} vs {again:?}"
+        );
     }
 
     #[test]

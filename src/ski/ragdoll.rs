@@ -235,6 +235,11 @@ const BINDING: Limit = Limit {
     stiffness: 20000.0,
     ..hinged([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [700.0, 1.0e4, 180.0])
 };
+/// Pull-out force of a pole from a gloved fist with its strap, N (about 90 kgf). The fist grips
+/// about 400 N and the wrist strap, which on a modern pole opens in a fall rather than dragging the
+/// arm after the pole, adds the rest. Calibrated, not a rating: a skier toppling onto a pole in the
+/// snow loads the grip with up to 750 N and keeps it, a 22 m/s dive with 1400 N and loses it.
+const GRIP_FORCE: f32 = 900.0;
 
 #[derive(Clone, Copy)]
 struct Joint {
@@ -248,11 +253,18 @@ struct Joint {
     limit: Option<Limit>,
     mirror: bool,
     name: &'static str,
-    /// Averaged torque at the limit about the joint frame's flex, side and twist axes, N m.
+    /// Averaged torque at the limit about the joint frame's flex, side and twist axes, N m; of a
+    /// gripped pole, in the first slot, the averaged pull on the grip, N.
     load: [f32; 3],
-    /// A broken joint's range opens by `BROKEN_SLACK`; a released binding lets go of the ski.
+    /// Position constraint impulse of `attach` this substep, kg m.
+    impulse: f32,
+    /// A broken joint's range opens by `BROKEN_SLACK`; a released detachable joint lets go.
     broken: bool,
-    binding: bool,
+    /// Gear (binding, pole grip) that lets go of what it holds instead of breaking.
+    detachable: bool,
+    /// Pull at which a detachable joint without a range lets go, N; infinite: it releases only
+    /// through its range limit.
+    grip: f32,
     /// Extra range the joint starts with when the animation handed it over outside its anatomical
     /// range; it closes at `SEED_RELAX`, so the limb is eased in rather than snapped.
     allow: f32,
@@ -264,7 +276,7 @@ impl Joint {
     }
 
     fn holds(&self) -> bool {
-        !(self.binding && self.broken)
+        !(self.detachable && self.broken)
     }
 }
 
@@ -726,8 +738,25 @@ impl SkiRagdoll {
 
     /// Skis whose binding has released.
     pub(crate) fn skis_off(&self) -> usize {
+        self.released(B::SkiL, B::SkiR)
+    }
+
+    /// Poles that have been pulled out of the hand.
+    pub(crate) fn poles_off(&self) -> usize {
+        self.released(B::PoleL, B::PoleR)
+    }
+
+    /// Released detachable joints holding `left` or `right`.
+    fn released(&self, left: B, right: B) -> usize {
         self.body.as_ref().map_or(0, |b| {
-            b.joints.iter().filter(|j| j.binding && j.broken).count()
+            b.joints
+                .iter()
+                .filter(|j| {
+                    j.detachable
+                        && j.broken
+                        && (j.child == left as usize || j.child == right as usize)
+                })
+                .count()
         })
     }
 }
@@ -814,8 +843,14 @@ impl Body {
                 mirror,
                 name,
                 load: [0.0; 3],
+                impulse: 0.0,
                 broken: false,
-                binding: matches!(child, B::SkiL | B::SkiR),
+                detachable: matches!(child, B::SkiL | B::SkiR | B::PoleL | B::PoleR),
+                grip: if matches!(child, B::PoleL | B::PoleR) {
+                    GRIP_FORCE
+                } else {
+                    f32::INFINITY
+                },
                 allow: 0.0,
             });
         };
@@ -881,7 +916,7 @@ impl Body {
                 Some(BINDING),
                 n("left binding", "right binding"),
             );
-            // The pole pivots freely in the fist (strap).
+            // The pole pivots freely in the fist and is pulled out of it by `GRIP_FORCE`.
             join(
                 s(B::HandL, B::HandR),
                 s(B::PoleL, B::PoleR),
@@ -1001,6 +1036,9 @@ impl Body {
     /// loads nor breaks joints. Segment and snow contacts go last: whatever the joints leave,
     /// nothing ends a substep inside anything else.
     fn solve_positions(&mut self, h: f32, live: bool) {
+        for j in &mut self.joints {
+            j.impulse = 0.0;
+        }
         for k in 0..self.joints.len() {
             self.attach(k);
         }
@@ -1009,6 +1047,9 @@ impl Body {
         }
         for k in 0..self.joints.len() {
             self.attach(k);
+            if live {
+                self.pull(k, h);
+            }
         }
         for k in 0..self.joints.len() {
             let joint = self.joints[k];
@@ -1071,7 +1112,8 @@ impl Body {
         }
         let (bp, bc) = (self.bodies[j.parent], self.bodies[j.child]);
         let (wp, wc) = (bp.point(j.pa), bc.point(j.pc));
-        self.shift(j.child, Some(j.parent), wc - bc.x, wp - bp.x, wp - wc);
+        let lambda = self.shift(j.child, Some(j.parent), wc - bc.x, wp - bp.x, wp - wc);
+        self.joints[k].impulse += lambda;
     }
 
     /// Joint rotation: child joint frame in the parent's.
@@ -1109,7 +1151,7 @@ impl Body {
         let j = &mut self.joints[k];
         let mut over = 0.0;
         // A binding's heel releases only when the boot levers forward off the ski (-X).
-        let flex = if j.binding {
+        let flex = if j.detachable {
             (-torque.x).max(0.0)
         } else {
             torque.x.abs()
@@ -1122,12 +1164,32 @@ impl Body {
             over += (j.load[a] / l.strength[a]).powi(2);
         }
         if !j.broken && over > 1.0 {
-            j.broken = true;
-            if j.binding {
-                self.pairs.push((j.parent, j.child));
-            } else {
-                self.injuries.push(j.name);
-            }
+            self.fail(k);
+        }
+    }
+
+    /// Pulls on a gripped joint (pole in the fist): the constraint force averaged over `LOAD_TIME`
+    /// pulls it out above `grip`.
+    fn pull(&mut self, k: usize, h: f32) {
+        let j = &mut self.joints[k];
+        if !j.holds() || !j.grip.is_finite() {
+            return;
+        }
+        let force = j.impulse / (h * h);
+        j.load[0] += (force - j.load[0]) * (h / LOAD_TIME).min(1.0);
+        if j.load[0] > j.grip {
+            self.fail(k);
+        }
+    }
+
+    /// A detachable joint lets go and its two segments collide from now on; any other breaks.
+    fn fail(&mut self, k: usize) {
+        let j = &mut self.joints[k];
+        j.broken = true;
+        if j.detachable {
+            self.pairs.push((j.parent, j.child));
+        } else {
+            self.injuries.push(j.name);
         }
     }
 
@@ -1539,6 +1601,7 @@ mod tests {
             "a 2 m drop broke {:?}",
             r.injuries()
         );
+        assert_eq!(r.poles_off(), 0, "a 2 m drop lost a pole");
     }
 
     #[test]
@@ -1576,6 +1639,7 @@ mod tests {
         let mut r = thrown(&pose, Vec3::new(0.0, -12.0, -18.0), Vec3::X * -4.0);
         run_checked(&mut r, 360, "dive");
         assert!(!r.injuries().is_empty(), "a 22 m/s dive broke nothing");
+        assert!(r.poles_off() >= 1, "a 22 m/s dive kept both poles");
     }
 
     #[test]
@@ -1588,6 +1652,7 @@ mod tests {
             "toppling over broke {:?}",
             r.injuries()
         );
+        assert_eq!(r.poles_off(), 0, "toppling over lost a pole");
     }
 
     /// Slide over 2 s of a ski released on the slope, along vs across the fall line (the skier is
@@ -1598,9 +1663,8 @@ mod tests {
         r.activate(&pose, &pose, DT);
         let b = r.body.as_mut().unwrap();
         for k in 0..b.joints.len() {
-            if b.joints[k].binding {
-                b.joints[k].broken = true;
-                b.pairs.push((b.joints[k].parent, b.joints[k].child));
+            if b.joints[k].detachable {
+                b.fail(k);
             }
         }
         for (k, body) in b.bodies.iter_mut().enumerate() {
@@ -1671,5 +1735,43 @@ mod tests {
             last = Some(pose);
         }
         panic!("the showcase never crashed");
+    }
+
+    #[test]
+    fn a_perpendicular_landing_crashes_and_the_ragdoll_keeps_the_momentum() {
+        use super::super::anim::SkiAnimation;
+        use super::super::physics::{SkiControls, SkiCrashReason, Skier};
+        use super::super::rig::solve;
+        // Skis level, 8 m/s along the snow and 20 m/s into it (the speed after a 20 m drop).
+        let mut s = Skier::default();
+        s.reset_at(-40.0, 0.0, 0.0, 8.0);
+        s.grounded = false;
+        s.position.y = 2.0;
+        s.velocity.y = -20.0;
+        let (mut a, c) = (SkiAnimation::default(), SkiControls::default());
+        let mut last = None;
+        for _ in 0..120 {
+            a.update(&s, &c, DT);
+            let pose = solve(&s, &a);
+            let before = s.velocity;
+            s.step(&c, DT);
+            if let Some(crash) = s.crash {
+                assert_eq!(crash.reason, SkiCrashReason::HardImpact);
+                let mut r = SkiRagdoll::default();
+                r.activate(&last.unwrap_or(pose), &pose, DT);
+                // The skier's own pre-impact velocity, not the one the landing corrected.
+                let seed = r.centre().unwrap().1;
+                assert!(
+                    seed.distance(before) < 0.1 * before.length(),
+                    "seeded {seed} for {before}"
+                );
+                run_checked(&mut r, 360, "perpendicular landing");
+                assert!(r.skis_off() >= 1, "no binding released");
+                assert!(r.poles_off() >= 1, "no pole dropped");
+                return;
+            }
+            last = Some(pose);
+        }
+        panic!("the landing never crashed");
     }
 }

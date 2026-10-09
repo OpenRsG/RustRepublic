@@ -16,7 +16,9 @@ working Vulkan graphics driver. Development dependencies are optimized; a releas
 build is optional (`cargo run --release --locked`).
 
 The game runs without a Riders Republic installation. The white arena retains
-three small jumps and adds a **32 m hill with a 7 m kicker** at x = 60 m.
+three small jumps and adds a **32 m hill with a 7 m kicker** at x = 60 m. Behind the kicker a
+6 m table rises to a crest 18 m past the lip and falls away over 26 m, so flights land on a
+downslope instead of the flat.
 The forest, mountains, gates, sky dome and dirt course remain removed.
 Keys **1–4** select Downhill, Road, Slopestyle and Freeride. Switching resets to the
 flat start; R resets without changing the selected discipline.
@@ -26,6 +28,7 @@ Road has narrow drop grips, smooth tires and a visually rigid frame/fork.
 All four retain the shared wheel radius, wheelbase and bounded two-strut contact model.
 The fixed 120 Hz simulation supports pedaling, sprinting, braking, steering/lean,
 hops, wheelies, rear-wheel manuals, nose manuals and physical flips, rolls and yaw spins.
+Wheel spin, drivetrain and suspension movement feed the same animated rig.
 
 On one wheel the rider balances the bike: Up/Down shift the rider's weight and give a limited
 pitch torque (4 rad/s²). Landing a flip on the rear wheel (or the nose) leaves the bike to its
@@ -44,7 +47,22 @@ opens up to spot the landing. Skiers do the same: the chest and head lead a spin
 other way in the preload), the outside arm sweeps across the chest while the other opens
 behind, the torso arches back into a backflip with the arms reaching up or curls for a front
 flip, and the shoulders drop into a roll; a held grab takes the arms and torso over.
-Wheel spin, drivetrain and suspension movement feed the same animated rig.
+
+Driving the pedals hard (a sprint, or pedalling while the speed still climbs) the rider gets low
+and forward, throws the bike from side to side under them (up to three times the standing
+rock), drops the pelvis onto each pushing pedal, pulls the bar up on that side so the shoulders
+turn with every stroke, and flares the elbows. Once the speed stops climbing in a sprint the
+rider is spun out at top speed: lower, chest down, rocking less. All of it rides on springs, so
+starting, holding and easing off blend.
+
+No two landings are absorbed alike. The touchdown's direction sets a jolt held through the
+compression and released on a spring: the body is thrown to the low side of a leaned bike (on
+skis, the way the skis were sliding across their length), back as the rear wheel lands first,
+over the bars on a nose-first landing or one still rotating forward (on skis, over landed-on
+tips or back onto the tails), and the shoulders twist. A deterministic per-landing jitter varies
+the compression depth, each jolt axis and, on skis, how hard each arm flails. At speed the
+skier's free hands, and the poles they carry, wander a centimetre or two on incommensurate
+periods (snow chatter), fore-aft and sideways only, so the poles never ride still or in step.
 
 The live skeleton overlay is enabled at launch and uses the same solved joints
 as the rider animation. Blue marks the left side, pink the right and green the
@@ -73,7 +91,7 @@ load, so unloading a wheel fades its force instead of switching brake torque abr
 | Shift | Sprint while pedaling |
 | Space | Hop; holding does not re-hop on landing |
 | Q | Assisted wheelie |
-| Up / Down | Nose down / up while airborne |
+| Up / Down | Nose down / up while airborne; shift weight to balance on one wheel |
 | Left / Right | Airborne roll |
 | Z / X | Rear-wheel manual / nose manual while moving; no pedaling required |
 | E / T | Airborne yaw spin right / left |
@@ -131,6 +149,7 @@ Press **5** for a skier; **1–4** return to the bike. The code is in `src/ski/`
 - The legs keep clear of each other and the trunk: after the leg IK each knee swings about its hip-ankle line (at most 60 degrees, bone lengths unchanged) until thigh, knee and shin clear the other leg, its boot, the belly, chest and head. Before this, the snowplow crossed the knees by 15 cm. In the air outside a held grab, each ski turns with its shin no further than a ski boot lets the ankle (10 degrees back, 40 forward, 6 sideways and twisting).
 - Crashes hand over to an articulated rigid-body ragdoll (`ragdoll.rs`, extended position-based dynamics at 2,400 substeps a second). Twenty segments with anthropometric masses and inertias (pelvis, abdomen, thorax, head, upper arms, forearms, hands, thighs, shins, boots, skis, poles) are pinned at the skeleton's joints. Every joint has an anatomical range measured from the upright stance, for example hip flexion 120 / extension 20 / abduction 45 / adduction 30 degrees, knee 0-150 degrees with 5 degrees of side play, elbow 0-150, shoulder flexion to about 170 and abduction to 180 about a raised-arm centre, ski-boot ankle 10 back / 40 forward. Past the end of range the joint gives like a stiff spring (ligaments, the boot shell) and stops dead 6 degrees further. The torque holding each joint at its limit, averaged over 20 ms, is compared per axis with the joint's strength (knee: 250 N m hyperextension, 150 sideways, 100 twisting; neck 225/180/120; wrist 110/90/70 and so on). A joint over its strength breaks and its range opens by 50 degrees; it stays attached and still collides. The bindings release the skis forward (heel) or in twist (toe), never sideways, usually before the legs give in moderate falls, at about 2.5 times DIN 7 torques because the limp body levers the boots harder than a skier's working legs. Strengths are tuned so falling over, a stiff 2 m drop or a 1 m drop with forward speed break nothing, while 12-22 m/s tumbles and dives release skis and break joints. The HUD lists what broke and whether a ski came off.
 - Every pair of segments that is not jointed collides as rendered-size capsules, broken or not, so arms stay out of the torso, head and legs, legs out of each other, skis out of boots and poles out of limbs to within a few millimetres. Only the grip section of a pole may lie along its own wrist, and the upper arm collides from just below the shoulder, which sits inside the chest slab. Skis glide along their length (friction 0.05) and bite across it (0.8); anything lying in the snow has rolling resistance. Out-of-range or overlapping animated poses are eased into range at 230 degrees a second instead of snapped. The tests throw the skier down the hill straight, flipping, cartwheeling and corkscrewing, dive it head-first at 22 m/s, drop it and run the F6 crash, checking every tick that nothing sinks into the snow, no bone stretches, no two segments overlap by more than 5 mm (1 cm for a pole on a ski) and no joint passes its hard stop by more than a few degrees.
+- Hard impacts: closing speed into the snow above 14 m/s (a 10 m drop onto flat snow) always crashes, and above 0.65 of that a touchdown that also uses more than half of its tilt, crossed-ski or spin limit crashes too. The crash hands the ragdoll the pre-impact momentum (seed within a few percent of the velocity before the step). The fists hold the poles until the pull on a grip passes 900 N (low-passed over 20 ms): gentle drops and topples keep both poles, a head-first dive or a 20 m/s flat landing tears at least one away, after which the loose pole tumbles and collides like any other segment. The HUD adds "dropped a pole / dropped both poles" after the bindings. Poles are single rigid shafts and do not bend or snap.
 - F6 in ski mode loops: slalom + 360 Mute, backflip Safety, 540 Japan (lands switch), Daffy, then a deliberately incomplete front flip that crashes.
 
 Keys: W skate/pole, S plow/hockey stop, A/D carve, Shift tuck, Space jump, arrows flip/roll, E/T spin, Ctrl full flips, U picks the grab, B holds it, J/L picks the side, R resets.
@@ -145,14 +164,21 @@ The checks use terrain normals, actual posed wheel centres/axles and angular rat
 - A fully detached rider cannot apply steering, pedaling, hop or air-control torque.
 - Twelve posed rider/frame sphere proxies detect head, torso, knees, hands and bike
   strikes. They follow the same rig and trick assembly transforms as the meshes.
-- Closing speed above 22 m/s causes a hard-impact crash. Thresholds are authored
-  constants in `src/bike.rs`, relative to the local surface, not retail measurements.
+- Closing speed along the surface normal above 13 m/s (a flat landing from an 8.6 m
+  drop) is a hard-impact crash. Above 0.65 of that, a touchdown that also uses more
+  than half of any pitch, roll, tilt, slip or spin limit is one too. Thresholds are
+  authored constants in `src/bike.rs`, relative to the local surface, not retail
+  measurements.
 
 A crashed bike ignores riding inputs and falls, bounces, slides and tumbles with
 gravity, friction and angular impulses. The detached rider inherits linear/angular
 momentum and limb motion from the impact pose. Mass-weighted bone constraints,
 bounded joints and passive joint friction keep the ragdoll articulated; joint
-spheres and sampled bone capsules collide with the shared terrain.
+spheres and sampled bone capsules collide with the shared terrain. The hands keep hold
+of the bars and the feet stay on the pedals until the wreck pulls harder than they can
+hold (600 N per hand, 200 N per flat-pedal foot, sustained for 20 ms): a slow topple keeps
+the rider attached to the bike for a moment, while a hard impact tears hands and feet away
+at once. The HUD reports "let go of the bars" / "feet off the pedals".
 Penetration repair is separate from contact velocity, so getting out of the floor
 does not launch the rider. Resting bodies sleep instead of continually jittering.
 The crash persists until **R**, except that F6 explicitly resets between runs.
@@ -167,9 +193,9 @@ limb self-collision is not simulated. Extreme airborne poses can intersect.
 Press **F6** to start an automatic, repeating sequence:
 **Superman → backflip → frontflip → barrel roll → no hands + no feet →
 barspin + tailwhip → table → deliberately incomplete flip/crash**.
-Each run rolls from the summit, launches off the real ramp, shows its landing or
-crash for 2.5 seconds, then resets for the next run. The loop takes roughly
-100 seconds. It uses ordinary pedal, brake and bounded air-control inputs;
+Each run rolls from the summit without pedalling, launches off the real ramp, shows its
+landing or crash for 2.5 seconds, then resets for the next run. The loop takes roughly
+100 seconds. It uses ordinary brake and bounded air-control inputs;
 there are no airborne teleports, direct orientation writes or collision exemptions.
 
 The camera takes a side/rear angle and centres the bike for the longer released

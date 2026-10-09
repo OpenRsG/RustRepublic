@@ -203,6 +203,11 @@ impl SkiView<'_> {
                 1 => hurt += " | a ski came off",
                 _ => hurt += " | both skis came off",
             }
+            match self.ragdoll.poles_off() {
+                0 => {}
+                1 => hurt += " | dropped a pole",
+                _ => hurt += " | dropped both poles",
+            }
             format!(
                 "CRASHED: {} at {:.1} m/s{hurt} - R to reset",
                 c.reason.label(),

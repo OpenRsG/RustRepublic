@@ -17,6 +17,38 @@ struct Constraint {
     max: f32,
 }
 
+/// Rider mass, kg; shared out over the particles in proportion to `1 / inverse_mass`.
+const RIDER_MASS: f32 = 80.0;
+/// Pull a hand can hold against before the fingers open, N: a sustained pull of a few hundred N
+/// on a bar the fingers hook around.
+const HAND_GRIP_FORCE: f32 = 600.0;
+/// Pull a foot can hold against on a flat pedal (pins and friction only), N.
+const FOOT_GRIP_FORCE: f32 = 200.0;
+/// A grip whose demanded force stays above its strength for this long lets go for good, s.
+const GRIP_RELEASE_TIME: f32 = 0.02;
+/// Time over which a held point closes its remaining distance to the grip, s.
+const GRIP_CLOSE_TIME: f32 = 0.05;
+/// Wrists and ankles with the strength each can hold.
+const GRIPS: [(P, f32); 4] = [
+    (P::WristL, HAND_GRIP_FORCE),
+    (P::WristR, HAND_GRIP_FORCE),
+    (P::AnkleL, FOOT_GRIP_FORCE),
+    (P::AnkleR, FOOT_GRIP_FORCE),
+];
+
+/// A wrist or ankle still held to the bike at `anchor` (bike frame).
+#[derive(Clone, Copy, Default)]
+struct Grip {
+    point: usize,
+    anchor: Vec3,
+    strength: f32,
+    held: bool,
+    /// Time the demanded force has recently exceeded `strength`, s.
+    strain: f32,
+    /// Impulse applied this substep, N s.
+    impulse: Vec3,
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct Ragdoll {
     pub body: Option<Body>,
@@ -26,6 +58,8 @@ pub(crate) struct Ragdoll {
 pub(crate) struct Seed {
     pub positions: [Vec3; COUNT],
     velocities: [Vec3; COUNT],
+    /// Bike-frame position of each of `GRIPS` the rider still holds at the crash.
+    grips: [Option<Vec3>; 4],
 }
 
 pub(crate) struct Body {
@@ -35,6 +69,9 @@ pub(crate) struct Body {
     constraint_count: usize,
     radii: [f32; COUNT],
     inverse_mass: [f32; COUNT],
+    /// Kilograms per unit of `1 / inverse_mass`.
+    mass_unit: f32,
+    grips: [Grip; 4],
     pub sleeping: bool,
     quiet_time: f32,
 }
@@ -57,10 +94,24 @@ impl Ragdoll {
             bike.velocity + omega.cross(q * local[i]) + q * limb
         });
         self.previous = Some(local);
+        let pose = &bike.collision_pose;
+        let release = [
+            pose.hand_release[0],
+            pose.hand_release[1],
+            pose.foot_release[0],
+            pose.foot_release[1],
+        ];
         Seed {
             positions,
             velocities,
+            grips: std::array::from_fn(|k| (release[k] < 0.5).then(|| local[index(GRIPS[k].0)])),
         }
+    }
+
+    /// Which hands and feet have let go of the bike: `([left, right], [left, right])`.
+    pub fn let_go(&self) -> Option<([bool; 2], [bool; 2])> {
+        let g = &self.body.as_ref()?.grips;
+        Some(([!g[0].held, !g[1].held], [!g[2].held, !g[3].held]))
     }
 
     pub fn activate(&mut self, seed: Seed) {
@@ -83,6 +134,8 @@ impl Body {
             constraint_count: 0,
             radii: [0.055; COUNT],
             inverse_mass: [1.0; COUNT],
+            mass_unit: 1.0,
+            grips: [Grip::default(); 4],
             sleeping: false,
             quiet_time: 0.0,
         };
@@ -139,6 +192,16 @@ impl Body {
         ] {
             let rest = b.positions[index(a)].distance(b.positions[index(c)]);
             b.add(a, c, rest * 0.55, rest * 1.35);
+        }
+        b.mass_unit = RIDER_MASS / b.inverse_mass.iter().map(|w| 1.0 / w).sum::<f32>();
+        for (k, (p, strength)) in GRIPS.into_iter().enumerate() {
+            b.grips[k] = Grip {
+                point: index(p),
+                anchor: seed.grips[k].unwrap_or_default(),
+                strength,
+                held: seed.grips[k].is_some(),
+                ..default()
+            };
         }
         b
     }
@@ -284,6 +347,17 @@ impl Body {
             self.velocities[c.a] += impulse * self.inverse_mass[c.a];
             self.velocities[c.b] -= impulse * self.inverse_mass[c.b];
         }
+        let grip_targets: [Vec3; 4] = std::array::from_fn(|k| {
+            let g = &self.grips[k];
+            let arm = bike_q * g.anchor;
+            bike.velocity
+                + bike_omega.cross(arm)
+                + (bike.position + arm - self.positions[g.point]) / GRIP_CLOSE_TIME
+        });
+        for g in &mut self.grips {
+            g.impulse = Vec3::ZERO;
+        }
+        let limit_scale = dt / self.mass_unit;
         for _ in 0..100 {
             let mut residual = 0.0_f32;
             for (k, c) in self.constraints[..self.constraint_count].iter().enumerate() {
@@ -299,6 +373,20 @@ impl Body {
                     self.velocities[c.a] += n * (impulse * self.inverse_mass[c.a]);
                     self.velocities[c.b] -= n * (impulse * self.inverse_mass[c.b]);
                 }
+            }
+            // Force-limited grips: the accumulated impulse may not exceed strength * dt, so a bike
+            // that pulls harder than the fingers or pins can hold stops dragging the rider.
+            for (g, target) in self.grips.iter_mut().zip(grip_targets) {
+                if !g.held {
+                    continue;
+                }
+                let w = self.inverse_mass[g.point];
+                let wanted = (target - self.velocities[g.point]) / w;
+                let total = (g.impulse + wanted).clamp_length_max(g.strength * dt / self.mass_unit);
+                let applied = total - g.impulse;
+                g.impulse = total;
+                self.velocities[g.point] += applied * w;
+                residual = residual.max(applied.length() * w);
             }
             for i in 0..COUNT {
                 let n = normals[i];
@@ -320,6 +408,15 @@ impl Body {
             if residual < 1e-4 {
                 break;
             }
+        }
+        for g in self.grips.iter_mut().filter(|g| g.held) {
+            let saturated = g.impulse.length() >= limit_scale * g.strength * 0.999;
+            g.strain = if saturated {
+                g.strain + dt
+            } else {
+                (g.strain - dt).max(0.0)
+            };
+            g.held = g.strain < GRIP_RELEASE_TIME;
         }
         for i in 0..COUNT {
             let n = normals[i];
@@ -380,6 +477,7 @@ mod tests {
         let mut body = Body::new(Seed {
             positions,
             velocities: [Vec3::ZERO; COUNT],
+            grips: [None; 4],
         });
         bike.position.x = -50.0;
         let dt = 1.0 / 120.0;
@@ -445,5 +543,95 @@ mod tests {
         );
         ragdoll.reset();
         assert!(ragdoll.body.is_none());
+    }
+
+    /// Drives the bike and ragdoll like `game::simulate` until the bike crashes, then returns
+    /// the wreck and rider.
+    fn crash_from(mut bike: Bike, feet_off: bool) -> (Bike, Ragdoll) {
+        let dt = 1.0 / 120.0;
+        let anim = AnimationState::default();
+        let mut ragdoll = Ragdoll::default();
+        for _ in 0..1200 {
+            bike.collision_pose = crate::scene::collision_pose(&bike, &anim);
+            if feet_off {
+                bike.collision_pose.foot_release = [1.0; 2];
+            }
+            let seed = ragdoll.sample(&bike, crate::scene::rider_points(&bike, &anim), dt);
+            bike.step(&crate::bike::Controls::default(), dt);
+            if bike.crash.is_some() {
+                ragdoll.activate(seed);
+                return (bike, ragdoll);
+            }
+        }
+        panic!("bike never crashed");
+    }
+
+    /// Metres from each wrist and ankle to its grip on the bike.
+    fn grip_gaps(bike: &Bike, body: &Body) -> [f32; 4] {
+        std::array::from_fn(|k| {
+            let g = &body.grips[k];
+            body.positions[g.point].distance(bike.position + bike.orientation() * g.anchor)
+        })
+    }
+
+    #[test]
+    fn gentle_crashes_keep_the_hands_on_the_bars_hard_ones_lose_them() {
+        let dt = 1.0 / 120.0;
+        let controls = crate::bike::Controls::default();
+        let mut gentle = Bike::default();
+        gentle.position.y += 0.15;
+        let mut hard = Bike::default();
+        hard.position.y += 40.0;
+        let ((mut gb, mut gr), (mut hb, mut hr)) =
+            (crash_from(gentle, true), crash_from(hard, false));
+        assert_eq!(
+            gb.crash.unwrap().reason,
+            crate::bike::CrashReason::MissingSupport
+        );
+        assert_ne!(
+            gb.crash.unwrap().reason,
+            crate::bike::CrashReason::HardImpact
+        );
+        assert_eq!(
+            hb.crash.unwrap().reason,
+            crate::bike::CrashReason::HardImpact
+        );
+        for _ in 0..(0.3 / dt) as usize {
+            gb.step(&controls, dt);
+            gr.step(&gb, dt);
+        }
+        for _ in 0..(0.1 / dt) as usize {
+            hb.step(&controls, dt);
+            hr.step(&hb, dt);
+        }
+        let (g, h) = (gr.body.as_ref().unwrap(), hr.body.as_ref().unwrap());
+        let gaps = grip_gaps(&gb, g);
+        assert!(
+            (0..2).any(|k| g.grips[k].held && gaps[k] < 0.15),
+            "gentle crash let go: held {:?} gaps {gaps:?}",
+            g.grips.map(|x| x.held)
+        );
+        assert!(
+            !h.grips[0].held && !h.grips[1].held,
+            "hard impact kept its hands: gaps {:?}",
+            grip_gaps(&hb, h)
+        );
+        assert_eq!(hr.let_go().unwrap().0, [true; 2]);
+    }
+
+    #[test]
+    fn grips_already_open_stay_open_and_a_yanked_grip_lets_go() {
+        let mut bike = Bike::default();
+        bike.collision_pose.hand_release = [1.0, 0.0];
+        let mut ragdoll = Ragdoll::default();
+        let local = crate::scene::rider_points(&bike, &AnimationState::default());
+        let seed = ragdoll.sample(&bike, local, 1.0 / 120.0);
+        ragdoll.activate(seed);
+        assert_eq!(ragdoll.let_go().unwrap().0, [true, false]);
+        bike.position.x = -50.0;
+        for _ in 0..3 {
+            ragdoll.step(&bike, 1.0 / 120.0);
+        }
+        assert_eq!(ragdoll.let_go().unwrap(), ([true; 2], [true; 2]));
     }
 }

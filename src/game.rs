@@ -858,6 +858,7 @@ fn update_hud(
     skeleton: Res<scene::SkeletonDebug>,
     animation: Res<scene::AnimationState>,
     showcase: Res<Showcase>,
+    ragdoll: Res<crate::ragdoll::Ragdoll>,
     ski: ski::SkiView,
     mut text: Query<&mut Text, With<Telemetry>>,
     mut help: Query<&mut Visibility, With<ControlHelp>>,
@@ -905,6 +906,17 @@ fn update_hud(
     } else {
         "RIDING"
     };
+    let mut mode = mode.to_string();
+    if bike.crash.is_some() {
+        if let Some((hands, feet)) = ragdoll.let_go() {
+            if hands == [true; 2] {
+                mode += " | let go of the bars";
+            }
+            if feet == [true; 2] {
+                mode += " | feet off the pedals";
+            }
+        }
+    }
     let on_off = |on: bool| if on { "on" } else { "off" };
     text.0 = format!(
         "{}   {:>3.0} km/h   |   {}\n{} {} {}\nAnimation: {} / {}\nTricks U/I/O: {} + {} + {} ({})\nActive: {} + {} + {} {}\nFront {}   Rear {}   |   {:.0} m traveled\nSkeleton {} (F1)   Rider mesh {} (F2)\nCamera {:+.0} deg   {:.1} m{}",

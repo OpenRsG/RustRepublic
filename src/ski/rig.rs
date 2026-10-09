@@ -845,8 +845,13 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         .clamp(0.40, 0.85);
     // Hips sit back over the heels as the knees flex.
     let k = ((0.80 - dist) / 0.40).clamp(0.0, 1.0);
-    let lateral = right * (0.05 * w.carve + sway);
-    let pelvis = m0 + (col * dist - fwd_b * (0.05 + 0.20 * k)).normalize() * dist + lateral;
+    // A touchdown jolt carries the hips the way the landing threw the body.
+    let [j_side, j_fore, j_twist] = w.jolt;
+    let lateral = right * (0.05 * w.carve + sway + 0.05 * j_side);
+    let pelvis = m0
+        + (col * dist - fwd_b * (0.05 + 0.20 * k)).normalize() * dist
+        + lateral
+        + fwd_b * (0.04 * j_fore);
 
     // --- Torso frames. -----------------------------------------------------------------------
     // Slip angle of the velocity relative to the skis (positive = towards the left), faded in with
@@ -871,13 +876,15 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
     // A held grab owns the arms and torso; the leading fades out while it holds.
     let lead_w = 1.0 - smooth(3.0 * gw);
     let [spin_lead, flip_lead, roll_lead] = w.english.map(|e| e * lead_w);
-    let chest_twist = turn_twist + 1.6 * w.switch * w.switch_side + spin_lead;
+    let chest_twist = turn_twist + 1.6 * w.switch * w.switch_side + spin_lead + 0.25 * j_twist;
     let qp = roll_p * Quat::from_rotation_y(0.25 * chest_twist);
     // Angulation: the torso is inclined less than the hips; sway rolls it a little against them.
-    // In a roll the shoulders drop into it ahead of the hips.
-    let qc = rb
-        * Quat::from_axis_angle(Vec3::NEG_Z, lean * 0.45 - 2.0 * sway + 0.35 * roll_lead)
-        * Quat::from_rotation_y(chest_twist);
+    // In a roll the shoulders drop into it ahead of the hips; a landing jolt throws them over.
+    let qc =
+        rb * Quat::from_axis_angle(
+            Vec3::NEG_Z,
+            lean * 0.45 - 2.0 * sway + 0.35 * roll_lead + 0.3 * j_side,
+        ) * Quat::from_rotation_y(chest_twist);
     // The head stays level and keeps looking down the hill while the chest twists and leans.
     let qh = qc.slerp(r * Quat::from_rotation_y(chest_twist), 0.6);
     let gaze = unit(
@@ -893,6 +900,7 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         + 1.05 * w.tuck * (1.0 - 0.3 * w.air)
         + 0.35 * w.air_tuck
         - 0.45 * flip_lead
+        + 0.4 * j_fore
         + 0.18 * tall
         + 0.78 * crunch
         + 0.10 * w.plow
@@ -1090,8 +1098,10 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         // Spinning, the arm on the outside of the turn sweeps across the chest to lead it and the
         // other opens behind; the arms reach up in a backflip and down in a front flip.
         ht += qc * Vec3::new(-0.2 * spin_lead, 0.12 * flip_lead, -0.25 * spin_lead * g) * w.air;
-        // Free hands trail the body's acceleration.
-        ht += w.hand[h] * ((1.0 - w.pole) * (1.0 - 0.6 * w.tuck));
+        // Free hands trail the body's acceleration and wander with the snow chatter (not while
+        // a planted pole holds the fist on its line).
+        ht += (w.hand[h] + w.chatter[h] * (1.0 - w.plant_w[h]))
+            * ((1.0 - w.pole) * (1.0 - 0.6 * w.tuck));
         // How far this hand is into a reach across the body for a grab.
         let mut cross_w = 0.0;
         if let Some(sp) = &spec {
@@ -1785,7 +1795,9 @@ mod tests {
                     c.steer = if (i / 120) % 2 == 0 { 1.0 } else { -1.0 };
                     false
                 }),
-                0.02,
+                // The trailing basket's lift at an edge change is ~18 mm/tick^2; the snow
+                // chatter's hand wander adds up to 3 more.
+                0.025,
             ),
             (
                 "hockey stop",

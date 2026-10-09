@@ -131,8 +131,15 @@ pub const LAND_SLIP_LIMIT: f32 = 0.7;
 const LAND_SLIP_MIN_SPEED: f32 = 3.0;
 /// Largest angular speed at touchdown, rad/s.
 pub const LAND_SPIN_LIMIT: f32 = 5.0;
-/// Wheel closing speed along the surface normal that is always a crash, m/s.
-pub const HARD_IMPACT_SPEED: f32 = 22.0;
+/// Wheel closing speed along the surface normal that is always a crash, m/s. A flat landing from
+/// an 8.6 m drop closes at sqrt(2 g h) = 13 m/s, about what a full-suspension MTB can absorb.
+pub const HARD_IMPACT_SPEED: f32 = 13.0;
+/// Fraction of `HARD_IMPACT_SPEED` that already crashes a landing using more than
+/// `LAND_MARGINAL_USE` of any attitude limit: the suspension is spent and nothing is left to
+/// correct the error.
+const HARD_IMPACT_MARGINAL: f32 = 0.65;
+/// Fraction of a pitch/roll/tilt/slip/spin limit above which a landing counts as marginal.
+const LAND_MARGINAL_USE: f32 = 0.5;
 /// Hands (or feet) count as holding when `2 - released[0] - released[1]` reaches this.
 const SUPPORT_MIN: f32 = 0.5;
 /// Rider/frame proxy penetration that counts as hitting the floor, metres.
@@ -170,6 +177,13 @@ const KICKER_HEIGHT: f32 = 7.0;
 const KICKER_LENGTH: f32 = 10.0;
 const KICKER_FALL: f32 = 4.0;
 const KICKER_ROUND: f32 = 1.0;
+/// Landing below the kicker: a table rising from the kicker's foot to a crest, then a long
+/// downslope that both the shorter ski flights and the longer bike flights land on. Crest, height
+/// and the lengths of its faces, m.
+const HILL_LANDING_Z: f32 = -102.0;
+const HILL_LANDING_HEIGHT: f32 = 6.0;
+const HILL_LANDING_RISE: f32 = 14.0;
+const HILL_LANDING_FALL: f32 = 26.0;
 
 fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
@@ -182,11 +196,29 @@ fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
     a.min(b) - h * h * k * 0.25
 }
 
+/// Height of a mound `s` metres past its crest (negative before it): quadratic rise and fall
+/// faces, rounded where they meet.
+fn mound(s: f32, height: f32, rise: f32, fall: f32, round: f32) -> f32 {
+    let up = height * (1.0 + s / rise).max(0.0).powi(2);
+    let down = height * (1.0 - s / fall).max(0.0).powi(2);
+    smooth_min(up, down, round)
+}
+
 /// Height of one jump `s` metres past its crest (negative before it).
 fn jump_profile(s: f32) -> f32 {
-    let rise = JUMP_HEIGHT * (1.0 + s / JUMP_RISE).max(0.0).powi(2);
-    let fall = JUMP_HEIGHT * (1.0 - s / JUMP_FALL).max(0.0).powi(2);
-    smooth_min(rise, fall, JUMP_ROUND)
+    mound(s, JUMP_HEIGHT, JUMP_RISE, JUMP_FALL, JUMP_ROUND)
+}
+
+/// Hill landing transition: its curved fall face meets the descent of a kicker flight at a few
+/// degrees, so the bike closes on the surface at a few m/s instead of its full fall speed.
+fn landing_profile(z: f32) -> f32 {
+    mound(
+        HILL_LANDING_Z - z,
+        HILL_LANDING_HEIGHT,
+        HILL_LANDING_RISE,
+        HILL_LANDING_FALL,
+        JUMP_ROUND,
+    )
 }
 
 /// Hill height profile along z: flat summit, smooth descent to the foot, smooth back taper.
@@ -210,7 +242,7 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     let jump_width = 1.0 - smoothstep(2.0, 4.0, x.abs());
     let jumps: f32 = JUMP_CRESTS.iter().map(|d| jump_profile(-z - d)).sum();
     let hill_width = 1.0 - smoothstep(HILL_HALF_FLAT, HILL_HALF_WIDTH, (x - HILL_X).abs());
-    jump_width * jumps + hill_width * (hill_profile(z) + kicker_profile(z))
+    jump_width * jumps + hill_width * (hill_profile(z) + kicker_profile(z) + landing_profile(z))
 }
 
 /// Terrain gradient (dh/dx, dh/dz).
@@ -772,20 +804,29 @@ impl Bike {
         } else {
             0.0
         };
-        let tilted_tire = (0..2).any(|i| {
-            grounded[i]
-                && (self.rot * self.collision_pose.wheel_axes[i])
-                    .dot(contacts[i].normal)
-                    .abs()
-                    > LAND_ROLL_LIMIT.sin()
-        });
-        let misaligned = up.dot(n) < LAND_TILT_LIMIT.cos()
-            || fwd.dot(n).abs() > LAND_PITCH_LIMIT.sin()
-            || right.dot(n).abs() > LAND_ROLL_LIMIT.sin()
-            || tilted_tire
-            || slip > LAND_SLIP_LIMIT
-            || self.angular_velocity().length() > LAND_SPIN_LIMIT;
-        let reason = if impact > HARD_IMPACT_SPEED {
+        let use_of_limits = [
+            up.dot(n).clamp(-1.0, 1.0).acos() / LAND_TILT_LIMIT,
+            fwd.dot(n).abs() / LAND_PITCH_LIMIT.sin(),
+            right.dot(n).abs() / LAND_ROLL_LIMIT.sin(),
+            (0..2)
+                .filter(|&i| grounded[i])
+                .map(|i| {
+                    (self.rot * self.collision_pose.wheel_axes[i])
+                        .dot(contacts[i].normal)
+                        .abs()
+                        / LAND_ROLL_LIMIT.sin()
+                })
+                .fold(0.0, f32::max),
+            slip / LAND_SLIP_LIMIT,
+            self.angular_velocity().length() / LAND_SPIN_LIMIT,
+        ]
+        .into_iter()
+        .fold(0.0, f32::max);
+        let misaligned = use_of_limits > 1.0;
+        let reason = if impact > HARD_IMPACT_SPEED
+            || impact > HARD_IMPACT_SPEED * HARD_IMPACT_MARGINAL
+                && use_of_limits > LAND_MARGINAL_USE
+        {
             CrashReason::HardImpact
         } else if misaligned {
             CrashReason::BadLanding
@@ -2042,6 +2083,7 @@ mod tests {
         }
     }
 
+    /// A bike launched 1.5 m up at 9 m/s, held in a flip and turned `turn` radians about its pitch
     /// axis by a bang-bang controller, then given 3 s in total.
     fn flip_flight(turn: f32) -> Bike {
         let mut b = Bike::default();
@@ -2111,5 +2153,33 @@ mod tests {
         b.collision_pose.foot_release = [1.0; 2];
         run(&mut b, Controls::default(), 2.0);
         assert_eq!(b.crash.map(|k| k.reason), Some(CrashReason::MissingSupport));
+    }
+    /// Drops an upright bike rolled by `roll` radians from `height` metres and returns how it lands.
+    fn drop_landing(height: f32, roll: f32) -> Option<Crash> {
+        let mut b = Bike::default();
+        b.position.y += height;
+        b.rot = Quat::from_rotation_z(roll);
+        b.sync_attitude();
+        for _ in 0..(3.0 / DT) as usize {
+            b.step(&Controls::default(), DT);
+            if b.crash.is_some() || b.grounded == [true; 2] {
+                break;
+            }
+        }
+        b.crash
+    }
+
+    #[test]
+    fn flat_landings_crash_above_13_ms_and_marginal_ones_above_8_ms() {
+        // Closing speeds sqrt(2 g h): 6 m -> 10.8, 10 m -> 14.0 m/s.
+        assert!(drop_landing(6.0, 0.0).is_none(), "clean 6 m drop");
+        let hard = drop_landing(10.0, 0.0).expect("10 m drop");
+        assert_eq!(hard.reason, CrashReason::HardImpact);
+        assert!(hard.impact > HARD_IMPACT_SPEED);
+        // A 0.4 rad roll uses 69 % of the roll limit: fine at 5 m/s, a crash at 10.8 m/s.
+        assert!(drop_landing(1.3, 0.4).is_none(), "gentle rolled drop");
+        let marginal = drop_landing(6.0, 0.4).expect("hard rolled drop");
+        assert_eq!(marginal.reason, CrashReason::HardImpact);
+        assert!(marginal.impact < HARD_IMPACT_SPEED);
     }
 }

@@ -257,7 +257,7 @@ fn unit(x: f32, y: f32, z: f32) -> Vec3 {
     Vec3::new(x, y, z).normalize()
 }
 
-fn smooth01(a: f32, b: f32, x: f32) -> f32 {
+pub(crate) fn smooth01(a: f32, b: f32, x: f32) -> f32 {
     let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -479,9 +479,12 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         Transform::IDENTITY
     };
     // Standing strokes rock the drawn bike under the rider about the tyre contact line, against
-    // the pelvis sway. Display only: `collision_pose` and `rider_points` solve without it.
+    // the pelvis sway; a sprint throws it three times as far. Display only: `collision_pose` and
+    // `rider_points` solve without it.
     let rock = if rocking {
-        Quat::from_rotation_z(-ROCK * body.pedal * body.stand * r.crank.sin())
+        Quat::from_rotation_z(
+            -ROCK * body.pedal * body.stand * (1.0 + 2.0 * body.effort) * r.crank.sin(),
+        )
     } else {
         Quat::IDENTITY
     };
@@ -523,18 +526,25 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     // two pedals, and a stroke never fully straightens the leg.
     let leg_max = (THIGH + SHIN) * 0.99;
     let sag = (body.sag * 0.5).clamp(-0.025, 0.06);
-    // Standing strokes rock the pelvis over the pushing pedal; a lean carries it outboard of the
-    // bike (the bike leans more than the rider).
-    let sway = -body.pedal * (0.012 + 0.03 * body.stand) * r.crank.sin();
+    // Standing strokes rock the pelvis over the pushing pedal (further and dropping onto it in a
+    // sprint); a lean carries it outboard of the bike (the bike leans more than the rider).
+    let stroke = r.crank.sin();
+    let sway = -body.pedal * (0.012 + 0.03 * body.stand) * (1.0 + 0.8 * body.effort) * stroke;
     let lean_x = 0.2 * body.turn;
     let [throw, twist, drop, tuck] = body.english;
-    // Barrel roll: the hips counter the dropped shoulder; a tucked rotation sinks them.
+    let [j_side, j_fore, j_twist] = body.jolt;
+    // Barrel roll: the hips counter the dropped shoulder; a tucked rotation sinks them. A landing
+    // jolt carries them to the low side and fore/aft.
     let mut hip = HIP_REST
         + SEAT_DIR * (look.post - 0.60)
         + Vec3::new(
-            body.lateral + lean_x + sway + 0.04 * drop,
-            0.22 * body.stand - 0.11 * body.crouch - sag - 0.07 * tuck,
-            0.22 * body.back - 0.03 * body.stand + 0.04 * throw,
+            body.lateral + lean_x + sway + 0.04 * drop - 0.04 * j_side,
+            0.22 * body.stand
+                - 0.11 * body.crouch
+                - sag
+                - 0.07 * tuck
+                - 0.02 * body.effort * stroke * stroke,
+            0.22 * body.back - 0.03 * body.stand + 0.04 * throw - 0.03 * j_fore,
         );
     {
         const K: f32 = 0.05;
@@ -594,17 +604,21 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         .lerp(fold_dir, 0.6 * body.fold)
         .try_normalize()
         .unwrap_or(Vec3::Y);
-    let mut shoulder = hip + dir * (on_grips.length() * (1.0 - released) + TORSO * released);
+    let torso_len = on_grips.length() * (1.0 - released) + TORSO * released;
+    let mut shoulder = hip + dir * torso_len;
     // Shoulders swing against the pelvis on a standing stroke; in a lean the torso stays more
     // upright than the bike (shoulders outboard of the pelvis).
     shoulder.x += 0.13 * body.turn - 1.6 * sway;
     // Air body English: the shoulders drop into a barrel roll and lead a backflip (thrown back
-    // and up) or a front flip (over the bars); the arms bend to keep the grips.
+    // and up) or a front flip (over the bars); the arms bend to keep the grips. A landing jolt
+    // throws them further than the hips: to the low side and fore/aft.
     shoulder += Vec3::new(
-        -0.12 * drop,
+        -0.12 * drop - 0.08 * j_side,
         -0.04 * drop.abs() + 0.03 * throw,
-        0.07 * throw,
+        0.07 * throw - 0.08 * j_fore,
     );
+    // The offsets turn the spine, they do not stretch it.
+    shoulder = hip + (shoulder - hip).normalize_or(dir) * torso_len;
 
     // Shoulders follow the grip line (bars turned, whipped or tabled); modulo 180 degrees so an
     // x-up does not flip them, and fading out when the grips sit together.
@@ -621,8 +635,13 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         }
         None => Quat::IDENTITY,
     };
-    // A spin is led by the shoulders, turned ahead of the hips and the bike.
-    let sq = Quat::from_rotation_y(twist) * sq;
+    // A spin is led by the shoulders, turned ahead of the hips and the bike; in a roll the
+    // shoulder line tilts down to the dropped side. Sprinting, the rider pulls the bar up on the
+    // side of the pushing leg, so the shoulders turn with every stroke; a landing jolt twists them.
+    let pull = 0.15 * body.effort * body.pedal * stroke;
+    let sq = Quat::from_rotation_y(twist + pull + 0.2 * j_twist)
+        * Quat::from_rotation_z(0.35 * drop)
+        * sq;
     // Released feet leave the pelvis free to follow the shoulders. Keeping it pinned to the
     // saddle during Superman/table combinations would stretch the spine.
     let free_feet = (a.foot_rel[0] + a.foot_rel[1]) * 0.5;
@@ -682,7 +701,7 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     // flip).
     r.head_rot = Quat::from_rotation_y(0.7 * twist)
         * Quat::from_rotation_z(-0.8 * body.turn + 0.5 * drop)
-        * Quat::from_rotation_x(0.55 * fwd - 0.05 + 0.8 * body.surge + 0.6 * throw);
+        * Quat::from_rotation_x(0.55 * fwd - 0.05 + 0.8 * body.surge + 0.6 * throw - 0.3 * j_fore);
 
     // Limbs: attached target blended with the authored free pose by the release weight.
     let hover_lift = Vec3::new(0.0, 0.15, 0.0);
@@ -752,7 +771,9 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
                 + 0.6 * body.crouch.clamp(0.0, 1.0)
                 + 0.6 * inside
                 + 0.5 * throw.max(0.0)
-                + 0.3 * tuck),
+                + 0.3 * tuck
+                + 0.4 * body.effort
+                + 0.3 * body.top),
             0.25,
             0.55,
         );
@@ -1956,6 +1977,111 @@ mod tests {
         }
     }
 
+    /// Body English turns the spine without stretching it, keeps the hands on the grips, and
+    /// goes the right way: a backflip throws the shoulders back, a left roll drops the left one.
+    #[test]
+    fn body_english_keeps_the_rider_on_the_bike_and_leads_the_rotation() {
+        let shoulders = |english: [f32; 4]| {
+            let mut bike = Bike::default();
+            bike.suspension = [0.05; 2];
+            let mut a = AnimationState::default();
+            (a.stand, a.crouch) = (0.5, 0.3);
+            a.english = english;
+            check(&bike, &a, 0.03, 5e-3, &format!("{english:?}"));
+            let r = rig(&bike, &a);
+            (
+                r[P::ShoulderL],
+                r[P::ShoulderR],
+                r[P::Hip].distance(r[P::Shoulder]),
+            )
+        };
+        let (l0, r0, len0) = shoulders([0.0; 4]);
+        for e in [[1.0, 0.6, 0.8, 1.0], [-1.0, -0.6, -0.8, 1.0]] {
+            let (_, _, len) = shoulders(e);
+            assert!((len - len0).abs() < 0.03, "{e:?}: spine {len0} -> {len}");
+        }
+        let (lb, rb, _) = shoulders([1.0, 0.0, 0.0, 0.0]);
+        assert!(
+            lb.z + rb.z > l0.z + r0.z + 0.04,
+            "backflip throw: shoulders not back"
+        );
+        let (ll, rl, _) = shoulders([0.0, 0.0, 0.8, 0.0]);
+        assert!(
+            ll.y - rl.y < l0.y - r0.y - 0.03,
+            "left roll: left shoulder not dropped"
+        );
+    }
+
+    /// Sprinting from rest the rider drives hard while the speed climbs, then settles low once it
+    /// stops climbing; the rider stays on the bike throughout and the drawn bike rocks further.
+    #[test]
+    fn sprint_effort_builds_while_accelerating_and_settles_at_top_speed() {
+        const H: f32 = 1.0 / 120.0;
+        let mut bike = Bike::default();
+        let mut a = AnimationState::default();
+        let c = Controls {
+            pedal: 1.0,
+            sprint: true,
+            ..Controls::default()
+        };
+        let (mut early, mut rock) = (0.0_f32, 0.0_f32);
+        for k in 0..(25.0 / H) as usize {
+            bike.step(&c, H);
+            // Stay on the flat start: only the speed matters here.
+            (bike.position.x, bike.position.z) = (0.0, 0.0);
+            a.update(&Input::from_bike(&bike, &c), H);
+            if k as f32 * H < 2.0 {
+                early = early.max(a.effort);
+            }
+            if k % 6 == 0 {
+                check(&bike, &a, 5e-3, 5e-3, &format!("sprint tick {k}"));
+            }
+            rock = rock.max(
+                rig(&bike, &a)
+                    .frame
+                    .rotation
+                    .to_euler(EulerRot::ZXY)
+                    .0
+                    .abs(),
+            );
+        }
+        assert!(early > 0.8, "accelerating effort {early}");
+        assert!(
+            a.top > 0.6 && a.effort < 0.7,
+            "top {} effort {}",
+            a.top,
+            a.effort
+        );
+        assert!(rock > 1.5 * ROCK, "sprint rock {rock}");
+    }
+
+    /// A landing throws the body the way it came in (a left-leaned touchdown to the left), and
+    /// two identical landings are not absorbed identically.
+    #[test]
+    fn landing_jolt_follows_the_touchdown_and_varies() {
+        let c = Controls::default();
+        let land = |a: &mut AnimationState, roll: f32| {
+            let mut i = Input::from_bike(&Bike::default(), &c);
+            (i.grounded, i.air_time, i.vy, i.roll) = ([false; 2], 0.5, -6.0, roll);
+            for _ in 0..10 {
+                a.update(&i, DT / 4.0);
+            }
+            i.grounded = [true; 2];
+            for _ in 0..12 {
+                a.update(&i, DT / 4.0);
+            }
+            a.jolt
+        };
+        let mut a = AnimationState::default();
+        let left = land(&mut a, 0.3);
+        assert!(left[0] > 0.1, "left lean landing side jolt {left:?}");
+        let again = land(&mut a, 0.3);
+        assert!(
+            left.iter().zip(again).any(|(p, q)| (p - q).abs() > 0.02),
+            "identical landings: {left:?} vs {again:?}"
+        );
+    }
+
     /// Hips, torso and head must be drawn as one connected tree from the pelvis, hands included.
     #[test]
     fn skeleton_is_one_connected_tree() {
@@ -2100,6 +2226,7 @@ mod tests {
                     pitch_rate: 0.0,
                     yaw_rate: 0.0,
                     roll_rate: 0.0,
+                    ground_pitch: 0.0,
                 },
                 DT,
             );
@@ -2844,6 +2971,7 @@ mod tests {
                         pitch_rate: 0.0,
                         yaw_rate: 0.0,
                         roll_rate: 0.0,
+                        ground_pitch: 0.0,
                     },
                     dt,
                 );

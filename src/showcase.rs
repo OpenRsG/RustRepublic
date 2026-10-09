@@ -208,10 +208,9 @@ impl Showcase {
         }
         *input = Controls::default();
         match self.stage {
-            Stage::Approach => {
-                input.pedal = 1.0;
-                input.sprint = true;
-            }
+            // Rolling in off the summit (no pedalling) carries the rider onto the landing's
+            // downslope; a sprint overshoots it onto the flat.
+            Stage::Approach => {}
             Stage::Flight => {
                 let run = RUNS[self.index];
                 input.trick_side = -1.0;
@@ -227,7 +226,7 @@ impl Showcase {
                 input.air_pitch =
                     ((12.0 * (run.pitch - self.pitch_progress) - 4.0 * bike.pitch_rate) / 24.0)
                         .clamp(-1.0, 1.0);
-                let roll_target = if self.elapsed < 0.65 { 0.0 } else { run.roll };
+                let roll_target = if self.elapsed < 0.3 { 0.0 } else { run.roll };
                 input.air_roll =
                     -((12.0 * (roll_target - self.roll_progress) - 4.0 * bike.roll_rate) / 24.0)
                         .clamp(-1.0, 1.0);
