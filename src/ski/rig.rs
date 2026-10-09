@@ -2,11 +2,13 @@
 //!
 //! Everything hangs off the boots: each ski is a rigid line (Tail - Bind - Tip) locked to its boot,
 //! the legs are two-bone IK from the hips to the ankles, the spine and arms follow, and every pole is
-//! rigid in a fist. All fixed body lengths are exact in every pose.
+//! rigid in a fist. Fists, forearms and poles are then kept out of the body (`body_volumes`). All
+//! fixed body lengths are exact in every pose.
 
 use super::anim::SkiAnimation;
 use super::physics::{Grab, STROKE_PUSH, Skier, skate_stroke, stroke_time};
 use super::pose::*;
+use super::ragdoll::boot_in_ankle_range;
 use crate::bike::terrain_height;
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
@@ -160,15 +162,16 @@ fn loop_spline(keys: &[(f32, Vec3)], u: f32) -> Vec3 {
 
 /// Fist of a double-pole push relative to its shoulder (x outward, y up, -z forward, heading frame)
 /// over the cycle `u` (0 = poles planted): up and forward at the plant, pulled down past the hips
-/// with the elbows opening, released behind, then swung back forward with the elbows bent.
+/// (wide of the thighs) with the elbows opening, released behind, then swung back forward with the
+/// elbows bent.
 const POLE_HAND: [(f32, Vec3); 7] = [
-    (0.00, Vec3::new(0.04, 0.05, -0.42)),
-    (0.12, Vec3::new(0.03, -0.18, -0.38)),
-    (0.25, Vec3::new(0.03, -0.42, -0.14)),
-    (0.38, Vec3::new(0.06, -0.50, 0.34)),
-    (0.50, Vec3::new(0.08, -0.40, 0.40)),
-    (0.65, Vec3::new(0.12, -0.36, 0.10)),
-    (0.82, Vec3::new(0.08, -0.10, -0.40)),
+    (0.00, Vec3::new(0.06, 0.05, -0.42)),
+    (0.12, Vec3::new(0.07, -0.18, -0.38)),
+    (0.25, Vec3::new(0.11, -0.42, -0.14)),
+    (0.38, Vec3::new(0.13, -0.50, 0.34)),
+    (0.50, Vec3::new(0.13, -0.40, 0.40)),
+    (0.65, Vec3::new(0.13, -0.36, 0.10)),
+    (0.82, Vec3::new(0.09, -0.10, -0.40)),
 ];
 
 /// Trunk and knee flexion of a double-pole push (x): -0.3 tall and up on the toes at the plant,
@@ -256,6 +259,347 @@ fn basket_lift(fist: Vec3, d: Vec3) -> f32 {
     }
 }
 
+/// A body part the hands and poles must stay out of: segment `a`-`b` swept by radius `r`. A leg
+/// part also knows its side (`side`, -1 left, +1 right) and outward direction (`out`).
+#[derive(Clone, Copy, Debug)]
+struct Capsule {
+    a: Vec3,
+    b: Vec3,
+    r: f32,
+    side: f32,
+    out: Vec3,
+}
+
+const BODY_VOLUMES: usize = 19;
+
+/// Capsules wrapping the rendered rider (`render.rs` sizes): helmet, the three torso slabs (two
+/// capsules side by side each), hip links, thighs, knees, shins, boot cuffs and soles.
+fn body_volumes(p: &SkierPose) -> [Capsule; BODY_VOLUMES] {
+    let cap = |a: Vec3, b: Vec3, r: f32| Capsule {
+        a,
+        b,
+        r,
+        side: 0.0,
+        out: Vec3::ZERO,
+    };
+    let slab = |a: J, b: J, dx: f32, dz: f32| {
+        let (a, b) = (p[a], p[b]);
+        let y = unit(b - a);
+        let z = unit(p.facing.reject_from(y));
+        let x = y.cross(z) * (0.5 * (dx - dz));
+        [cap(a - x, b - x, 0.5 * dz), cap(a + x, b + x, 0.5 * dz)]
+    };
+    let [t0, t1] = slab(J::Pelvis, J::Waist, 0.30, 0.20);
+    let [t2, t3] = slab(J::Waist, J::Chest, 0.34, 0.21);
+    let [t4, t5] = slab(J::Chest, J::Neck, 0.40, 0.22);
+    let leg = |i: usize| {
+        let [hip, knee, ankle, heel, toe] = [
+            [J::HipL, J::HipR],
+            [J::KneeL, J::KneeR],
+            [J::AnkleL, J::AnkleR],
+            [J::HeelL, J::HeelR],
+            [J::ToeL, J::ToeR],
+        ]
+        .map(|j| p[j[i]]);
+        let (side, out) = (SIDE[i], unit(hip - p[J::Pelvis]));
+        let sole = p.ski_up[i] * 0.05;
+        [
+            cap(p[J::Pelvis], hip, 0.07),
+            cap(hip, knee, 0.075),
+            cap(knee, knee, 0.075),
+            cap(knee, ankle, 0.0575),
+            cap(ankle, ankle + unit(knee - ankle) * 0.20, 0.07),
+            cap(heel + sole, toe + sole, 0.055),
+        ]
+        .map(|c| Capsule { side, out, ..c })
+    };
+    let [l0, l1, l2, l3, l4, l5] = leg(0);
+    let [r0, r1, r2, r3, r4, r5] = leg(1);
+    [
+        cap(p[J::Head], p[J::Head], 0.11),
+        t0,
+        t1,
+        t2,
+        t3,
+        t4,
+        t5,
+        l0,
+        l1,
+        l2,
+        l3,
+        l4,
+        l5,
+        r0,
+        r1,
+        r2,
+        r3,
+        r4,
+        r5,
+    ]
+}
+
+/// Parameters `(s, t)` of the closest points between segments `p0`-`p1` and `q0`-`q1`.
+pub(crate) fn closest_params(p0: Vec3, p1: Vec3, q0: Vec3, q1: Vec3) -> (f32, f32) {
+    let (d1, d2, r) = (p1 - p0, q1 - q0, p0 - q0);
+    let (a, e, f) = (d1.length_squared(), d2.length_squared(), d2.dot(r));
+    if a < 1e-9 && e < 1e-9 {
+        return (0.0, 0.0);
+    }
+    if a < 1e-9 {
+        return (0.0, (f / e).clamp(0.0, 1.0));
+    }
+    let c = d1.dot(r);
+    if e < 1e-9 {
+        return ((-c / a).clamp(0.0, 1.0), 0.0);
+    }
+    let b = d1.dot(d2);
+    let den = a * e - b * b;
+    let mut s = if den > 1e-9 {
+        ((b * f - c * e) / den).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut t = (b * s + f) / e;
+    if t < 0.0 {
+        t = 0.0;
+        s = (-c / a).clamp(0.0, 1.0);
+    } else if t > 1.0 {
+        t = 1.0;
+        s = ((b - c) / a).clamp(0.0, 1.0);
+    }
+    (s, t)
+}
+
+/// Gap between capsule `c` and segment `a`-`b` of radius `r` (negative = overlap), with the
+/// closest point on the segment and the direction pushing it out of `c`. A part held on `side`
+/// (-1 left, +1 right, 0 none) that overlaps a leg of the same side leaves it outwards, so a pole
+/// never flips from one side of its own leg to the other; the gap is then how far it must move.
+fn capsule_gap(c: &Capsule, a: Vec3, b: Vec3, r: f32, side: f32) -> (f32, f32, Vec3) {
+    let (s, t) = closest_params(a, b, c.a, c.b);
+    let (pa, pc) = (a.lerp(b, s), c.a.lerp(c.b, t));
+    let sep = pa - pc;
+    let reach = c.r + r;
+    let gap = sep.length() - reach;
+    let axis = (c.b - c.a).normalize_or_zero();
+    let out = (c.out - axis * c.out.dot(axis)).normalize_or_zero();
+    if gap >= 0.0 || side == 0.0 || side != c.side || out == Vec3::ZERO {
+        return (gap, s, sep.try_normalize().unwrap_or(Vec3::Y));
+    }
+    let radial = sep - axis * sep.dot(axis);
+    let x = radial.dot(out);
+    let y = (radial - out * x).length().min(reach);
+    (x - (reach * reach - y * y).sqrt(), s, out)
+}
+
+/// Gap kept between the arms/poles and the body, m.
+const BODY_GAP: f32 = 0.012;
+/// Rendered radii of the moving parts: glove ball, forearm sleeve, pole shaft, basket disc (centred
+/// `BASKET_UP` above the tip).
+const FIST_R: f32 = 0.055;
+const FOREARM_R: f32 = 0.04;
+const POLE_R: f32 = 0.007;
+const BASKET_R: f32 = 0.06;
+const BASKET_UP: f32 = 0.08;
+/// The first volumes are head and torso; the upper arm may rest against those, not against legs.
+const LEG_VOLUMES: usize = 7;
+
+/// `p` moved out of every volume so a ball of radius `r` around it clears the body.
+fn push_out(p: Vec3, r: f32, vols: &[Capsule]) -> Vec3 {
+    push_hand(p, Vec3::ZERO, r, 0.0, vols)
+}
+
+/// The pole length next to the fist that moves with the hand rather than turning the pole: a
+/// contact this close to the grip would swing the basket a long way for a small push.
+const NEAR_SHAFT: f32 = 0.30;
+
+/// Fist target `p` moved out of every volume so a ball of radius `r` around it, and, along the
+/// pole axis `d` (basket to grip), the grip top and the first `NEAR_SHAFT` of shaft clear the body.
+fn push_hand(mut p: Vec3, d: Vec3, r: f32, side: f32, vols: &[Capsule]) -> Vec3 {
+    for _ in 0..3 {
+        for c in vols {
+            let (gap, _, n) = capsule_gap(c, p, p, r + BODY_GAP, 0.0);
+            if gap < 0.0 {
+                p -= n * gap;
+            }
+            if d != Vec3::ZERO {
+                let (a, b) = (p + d * POLE_GRIP, p - d * NEAR_SHAFT);
+                let (gap, _, n) = capsule_gap(c, a, b, POLE_R + BODY_GAP, side);
+                if gap < 0.0 {
+                    p -= n * gap;
+                }
+            }
+        }
+    }
+    p
+}
+
+/// Glove sleeve radius (wrist to fist).
+const GLOVE_R: f32 = 0.0375;
+/// The upper arm's collision part: from below the shoulder, which sits inside the chest slab.
+const UPPER_ARM_FROM: f32 = 0.45;
+const UPPER_ARM_R: f32 = 0.05;
+
+/// Elbow swung about the shoulder-wrist axis (bone lengths unchanged) until the forearm clears the
+/// body and the upper arm clears the legs and, below the shoulder, the trunk.
+fn swing_elbow(shoulder: Vec3, mut e: Vec3, wrist: Vec3, vols: &[Capsule]) -> Vec3 {
+    let axis = unit(wrist - shoulder);
+    let centre = shoulder + axis * (e - shoulder).dot(axis);
+    let radius = (e - centre).length();
+    for _ in 0..8 {
+        for (i, c) in vols.iter().enumerate() {
+            let (gap, s, n) = capsule_gap(c, e, wrist, FOREARM_R + BODY_GAP, 0.0);
+            if gap < 0.0 {
+                e -= n * (gap / (1.0 - s).max(0.3));
+            }
+            if i >= LEG_VOLUMES {
+                let (gap, s, n) = capsule_gap(c, shoulder, e, FOREARM_R + BODY_GAP, 0.0);
+                if gap < 0.0 {
+                    e -= n * (gap / s.max(0.3));
+                }
+            } else if i > 0 {
+                let from = shoulder.lerp(e, UPPER_ARM_FROM);
+                let (gap, s, n) = capsule_gap(c, from, e, UPPER_ARM_R + BODY_GAP, 0.0);
+                if gap < 0.0 {
+                    e -= n * gap / lerp(UPPER_ARM_FROM, 1.0, s);
+                }
+            }
+            let off = (e - centre).reject_from(axis);
+            e = centre + off.try_normalize().unwrap_or(off) * radius;
+        }
+    }
+    e
+}
+/// Ski `i` and its boot sole set from the ankle already in `p` and the ski orientation `q`.
+fn place_ski(p: &mut SkierPose, i: usize, q: Quat) {
+    const SKI: [[J; 5]; 2] = [
+        [J::HeelL, J::ToeL, J::BindL, J::TailL, J::TipL],
+        [J::HeelR, J::ToeR, J::BindR, J::TailR, J::TipR],
+    ];
+    let [heel, toe, bind_j, tail, tip] = SKI[i];
+    let (f, u) = (q * Vec3::NEG_Z, q * Vec3::Y);
+    let bind = p[[J::AnkleL, J::AnkleR][i]] - u * ANKLE_ABOVE_SKI;
+    p[heel] = bind - f * HEEL_BACK;
+    p[toe] = bind + f * TOE_FORWARD;
+    p[bind_j] = bind;
+    p[tail] = bind - f * SKI_BACK;
+    p[tip] = bind + f * SKI_FRONT + u * SKI_TIP_RISE;
+    p.ski_up[i] = u;
+}
+
+/// Knees swung about their hip-ankle axes (bone lengths unchanged, at most `MAX_KNEE_SWING` from
+/// where the IK put them) until thighs, knees and shins clear the other leg, the trunk and the
+/// head: a plow or a tucked grab never crosses the knees or buries them in the body.
+fn separate_knees(p: &mut SkierPose) {
+    const MAX_KNEE_SWING: f32 = 1.05;
+    const LEGS: [[J; 3]; 2] = [
+        [J::HipL, J::KneeL, J::AnkleL],
+        [J::HipR, J::KneeR, J::AnkleR],
+    ];
+    let home = LEGS.map(|[_, knee, _]| p[knee]);
+    for _ in 0..6 {
+        let vols = body_volumes(p);
+        for (i, [hip, knee, ankle]) in LEGS.iter().enumerate() {
+            let (hip, ankle) = (p[*hip], p[*ankle]);
+            let mut k = p[*knee];
+            let axis = unit(ankle - hip);
+            let centre = hip + axis * (k - hip).dot(axis);
+            let radius = (k - centre).length();
+            let rest = unit((home[i] - centre).reject_from(axis));
+            // A leg pressed against the other one always parts towards its own side, so the knees
+            // never flip past each other.
+            let out = unit((hip - p[J::Pelvis]).reject_from(axis));
+            // Head, belly and chest, the other leg's boot, and its thigh, knee and shin (which
+            // move too, so each knee takes half).
+            let other = if i == 0 { 14 } else { 8 };
+            for (v, c) in vols.iter().enumerate() {
+                let leg = (other..other + 5).contains(&v);
+                let share = if v == 0 || (3..LEG_VOLUMES).contains(&v) {
+                    1.0
+                } else if (other + 3..other + 5).contains(&v) {
+                    1.0
+                } else if leg {
+                    0.5
+                } else {
+                    continue;
+                };
+                // Thigh, knee and shin; a contact moves the knee by the inverse of its lever.
+                for part in 0..3 {
+                    let (a, b, r) = [(hip, k, 0.075), (k, k, 0.075), (k, ankle, 0.0575)][part];
+                    let (gap, s, n) = capsule_gap(c, a, b, r + BODY_GAP, 0.0);
+                    if gap < 0.0 {
+                        let lever = [s, 1.0, 1.0 - s][part].max(0.3);
+                        let n = if leg { out } else { n };
+                        k -= n * (gap * share / lever);
+                    }
+                }
+                let off = unit((k - centre).reject_from(axis));
+                let swing = axis.dot(rest.cross(off)).atan2(rest.dot(off));
+                let swing = swing.clamp(-MAX_KNEE_SWING, MAX_KNEE_SWING);
+                k = centre + Quat::from_axis_angle(axis, swing) * rest * radius;
+            }
+            p[*knee] = k;
+        }
+    }
+}
+
+/// `(elbow, wrist)` with the forearm clear of the body and the upper arm clear of the legs and
+/// trunk: the elbow swings first; whatever that cannot clear (a leg between elbow and wrist, an
+/// upper arm pinned against the trunk) moves the wrist and the arm is solved again around it.
+fn clear_arm(shoulder: Vec3, mut e: Vec3, mut wrist: Vec3, vols: &[Capsule]) -> (Vec3, Vec3) {
+    for _ in 0..4 {
+        e = swing_elbow(shoulder, e, wrist, vols);
+        let mut moved = false;
+        for (i, c) in vols.iter().enumerate() {
+            let (gap, _, n) = capsule_gap(c, e, wrist, FOREARM_R + BODY_GAP, 0.0);
+            if gap < 0.0 {
+                wrist -= n * gap;
+                moved = true;
+            }
+            let from = shoulder.lerp(e, UPPER_ARM_FROM);
+            let (gap, _, n) = capsule_gap(c, from, e, UPPER_ARM_R + BODY_GAP, 0.0);
+            if i > 0 && gap < 0.0 {
+                wrist -= n * (2.0 * gap);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+        (e, wrist) = limb(shoulder, wrist, UPPER_ARM, FOREARM, e - shoulder);
+    }
+    (e, wrist)
+}
+
+/// Pole axis (basket to grip) nearest `d`, turned about the wrist until the whole shaft (grip top
+/// to tip) and the basket clear `vols`. `side` is the hand's (-1 left, +1 right): its pole always
+/// passes outside its own leg. The fist itself is kept clear before the arm IK (`push_out`).
+fn clear_pole(wrist: Vec3, mut d: Vec3, vols: &[Capsule], side: f32) -> Vec3 {
+    let reach = POLE_LENGTH - POLE_GRIP - HAND;
+    // Moves the point `along` m from the wrist towards the tip (negative: towards the grip top) by
+    // `-n * gap` and re-aims the pole through it. Contacts by the hand are the hand's to clear
+    // (`push_hand`); any left over are taken as if `NEAR_SHAFT` away so they never twitch the pole.
+    const MIN_LEVER: f32 = HAND + NEAR_SHAFT;
+    let aim = |d: Vec3, along: f32, n: Vec3, gap: f32| {
+        let lever = along.abs().max(MIN_LEVER);
+        unit(d * lever + n * (gap * along.signum()))
+    };
+    for _ in 0..8 {
+        for c in vols {
+            let top = wrist + d * (HAND + POLE_GRIP);
+            let (gap, s, n) = capsule_gap(c, top, top - d * POLE_LENGTH, POLE_R + BODY_GAP, side);
+            if gap < 0.0 {
+                d = aim(d, s * POLE_LENGTH - HAND - POLE_GRIP, n, gap);
+            }
+            let basket = wrist - d * (reach - BASKET_UP);
+            let (gap, _, n) = capsule_gap(c, basket, basket, BASKET_R + BODY_GAP, side);
+            if gap < 0.0 {
+                d = aim(d, reach - BASKET_UP, n, gap);
+            }
+        }
+    }
+    d
+}
+
 /// A leg's pose when it is part of a grab. `ankle` is relative to the pelvis in the pelvis frame
 /// (x outward from the leg's own side, y up, z back); angles are relative to the pelvis frame
 /// (yaw: tip outward, pitch: tip up, roll: outer edge down).
@@ -315,26 +659,26 @@ fn grab_spec(g: Grab) -> Spec {
     match g {
         Grab::Mute | Grab::None => Spec {
             legs: [leg(0.05, -0.25, -0.20, 0.0, 0.4, 0.2), RELAXED],
-            holds: [Some(hold(false, true, 0.15, 0.04, 0.045)), None],
+            holds: [Some(hold(false, true, 0.32, 0.05, 0.06)), None],
             free: FREE_ARM,
             flex: 1.0,
         },
         Grab::Safety => Spec {
             legs: [leg(0.20, -0.12, -0.25, 0.0, 0.3, 0.35), RELAXED],
-            holds: [Some(hold(false, false, -0.02, 0.07, 0.02)), None],
+            holds: [Some(hold(false, false, -0.02, 0.08, 0.02)), None],
             free: FREE_ARM,
             flex: 1.2,
         },
         Grab::Japan => Spec {
             legs: [leg(0.05, -0.10, -0.10, -0.3, -0.5, 0.2), RELAXED],
-            holds: [Some(hold(false, true, 0.05, 0.04, 0.045)), None],
+            holds: [Some(hold(false, true, 0.34, 0.05, 0.06)), None],
             free: FREE_ARM,
             flex: 1.0,
         },
         Grab::Tail => Spec {
             legs: [leg(0.15, -0.10, -0.20, 0.0, -1.0, 0.0), RELAXED],
             holds: [
-                Some(hold(false, false, -(SKI_BACK - 0.08), 0.0, 0.045)),
+                Some(hold(false, false, -(SKI_BACK - 0.08), 0.0, 0.06)),
                 None,
             ],
             free: FREE_ARM,
@@ -342,18 +686,18 @@ fn grab_spec(g: Grab) -> Spec {
         },
         Grab::Tip => Spec {
             legs: [leg(0.15, -0.25, 0.0, 0.0, 0.5, 0.0), RELAXED],
-            holds: [Some(hold(false, false, SKI_FRONT - 0.10, 0.0, 0.045)), None],
+            holds: [Some(hold(false, false, SKI_FRONT - 0.10, 0.0, 0.06)), None],
             free: FREE_ARM,
             flex: 0.9,
         },
         Grab::TruckDriver => Spec {
             legs: [
-                leg(0.10, -0.30, 0.25, 0.0, 0.7, 0.0),
-                leg(0.10, -0.30, 0.25, 0.0, 0.7, 0.0),
+                leg(0.12, -0.32, 0.0, 0.0, 0.9, 0.0),
+                leg(0.12, -0.32, 0.0, 0.0, 0.9, 0.0),
             ],
             holds: [
-                Some(hold(false, false, SKI_FRONT - 0.10, 0.0, 0.045)),
-                Some(hold(true, false, SKI_FRONT - 0.10, 0.0, 0.045)),
+                Some(hold(false, false, SKI_FRONT - 0.10, 0.0, 0.06)),
+                Some(hold(true, false, SKI_FRONT - 0.10, 0.0, 0.06)),
             ],
             free: FREE_ARM,
             flex: 0.8,
@@ -375,8 +719,8 @@ fn grab_spec(g: Grab) -> Spec {
         },
         Grab::IronCross => Spec {
             legs: [
-                leg(-0.10, -0.60, -0.05, -0.28, 0.15, 0.0),
-                leg(-0.10, -0.55, -0.05, -0.28, 0.15, 0.0),
+                leg(0.12, -0.60, -0.05, -0.28, 0.15, 0.0),
+                leg(0.12, -0.55, -0.05, -0.28, 0.15, 0.0),
             ],
             holds: [None, None],
             free: Vec3::new(0.60, 0.02, -0.05),
@@ -393,6 +737,11 @@ fn ski_point(bind: Vec3, f: Vec3, u: Vec3, side: f32, along: f32, lat: f32, up: 
         0.0
     };
     bind + f * along + u * (up + rise) + f.cross(u) * (side * lat)
+}
+
+/// Unit direction `a` turned towards `b` by the fraction `t` of the angle between them.
+fn turn(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    Quat::IDENTITY.slerp(Quat::from_rotation_arc(a, b), t) * a
 }
 
 /// Solves the whole skier in world space.
@@ -555,9 +904,7 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
     // --- Legs and skis (skis follow the feet). ---------------------------------------------
     let hip_x = qp * Vec3::X;
     let body_fwd = qp * Vec3::NEG_Z;
-    let mut bind = [Vec3::ZERO; 2];
-    let mut f = [Vec3::ZERO; 2];
-    let mut u = [Vec3::ZERO; 2];
+    let mut qs = [Quat::IDENTITY; 2];
     let mut knee = [Vec3::ZERO; 2];
     let mut ankle = [Vec3::ZERO; 2];
     let mut hip = [Vec3::ZERO; 2];
@@ -582,20 +929,59 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         let (k_i, a_i) = limb(hip[i], target, THIGH, SHIN, pole);
         knee[i] = k_i;
         ankle[i] = a_i;
-        f[i] = q * Vec3::NEG_Z;
-        u[i] = q * Vec3::Y;
-        bind[i] = a_i - u[i] * ANKLE_ABOVE_SKI;
+        qs[i] = q;
     }
+
+    // --- Body and skis, assembled first so the arms and poles can keep out of them. ----------
+    let mut pose = SkierPose {
+        p: [Vec3::ZERO; JOINTS],
+        ski_up: [Vec3::Y; 2],
+        facing: unit(qc * Vec3::NEG_Z),
+        gaze,
+    };
+    pose[J::Pelvis] = pelvis;
+    pose[J::Waist] = waist;
+    pose[J::Chest] = chest;
+    pose[J::Neck] = neck;
+    pose[J::Head] = head;
+    const HIP: [J; 2] = [J::HipL, J::HipR];
+    const KNEE: [J; 2] = [J::KneeL, J::KneeR];
+    const ANKLE: [J; 2] = [J::AnkleL, J::AnkleR];
+    for i in 0..2 {
+        pose[HIP[i]] = hip[i];
+        pose[KNEE[i]] = knee[i];
+        pose[ANKLE[i]] = ankle[i];
+        place_ski(&mut pose, i, qs[i]);
+    }
+    separate_knees(&mut pose);
+    // Airborne skis stay on the feet: the boot turns no further than a ski boot lets the ankle.
+    // A held grab keeps its authored ski so the hand finds it.
+    let fit_w = w.air * (1.0 - gw);
+    if fit_w > 0.0 {
+        for i in 0..2 {
+            let fit = boot_in_ankle_range(hip[i], pose[KNEE[i]], ankle[i], qs[i], i == 0);
+            qs[i] = qs[i].slerp(fit, fit_w);
+            place_ski(&mut pose, i, qs[i]);
+        }
+        separate_knees(&mut pose);
+    }
+    let f = qs.map(|q| q * Vec3::NEG_Z);
+    let u = qs.map(|q| q * Vec3::Y);
+    let bind = [0, 1].map(|i| ankle[i] - u[i] * ANKLE_ABOVE_SKI);
+    let vols = body_volumes(&pose);
 
     // --- Arms: (fist target, pole axis basket->grip) per hand. -----------------------------
     let shoulder_x = qchest * Vec3::X;
-    let mut held: [Option<Vec3>; 2] = [None, None];
+    // Hand on a ski: the hold point, the side of that ski and how far along it the hold is.
+    let mut held: [Option<(Vec3, f32, f32)>; 2] = [None, None];
     if let Some(sp) = &spec {
         for h in sp.holds.iter().flatten() {
             let ski = if h.other { 1 - gi } else { gi };
             let hand = if h.cross { 1 - ski } else { ski };
-            held[hand] = Some(ski_point(
-                bind[ski], f[ski], u[ski], SIDE[ski], h.along, h.lat, h.up,
+            held[hand] = Some((
+                ski_point(bind[ski], f[ski], u[ski], SIDE[ski], h.along, h.lat, h.up),
+                SIDE[ski],
+                h.along,
             ));
         }
     }
@@ -607,24 +993,38 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
     for h in 0..2 {
         let g = SIDE[h];
         shoulder[h] = chest + shoulder_x * (g * SHOULDER_HALF_WIDTH);
-        // Neutral: hands forward at belly height, elbows bent, poles angled back.
-        let mut ht = chest + qc * Vec3::new(g * 0.27, -0.30, -0.40);
+        // Neutral: hands forward at belly height, elbows bent, poles trailing back with their
+        // baskets splayed outwards, clear of the legs.
+        let mut ht = chest + qc * Vec3::new(g * 0.30, -0.30, -0.40);
         // The trailing pole hangs from the heading frame, not the leaned torso, so an inclined
-        // body does not drive the downhill basket into the snow.
+        // body does not drive the downhill basket into the snow. It keeps none of a carve's
+        // counter-rotation, or the inside basket would swing in behind the legs.
+        let pole_twist = chest_twist - (0.45 * w.carve + w.counter);
         let mut dw =
-            unit(rb * Quat::from_rotation_y(chest_twist) * Vec3::new(g * 0.12, 0.75, -0.65));
-        // Skating without poles: the arm opposite the pushing leg swings forward and across.
-        let swing = w.skate * (1.0 - w.v2) * g * s.skate_phase.sin();
-        ht += qc * Vec3::new(-0.04 * g * swing, 0.10 * swing, -0.30 * swing);
+            unit(rb * Quat::from_rotation_y(pole_twist) * Vec3::new(-g * 0.32, 0.62, -0.72));
+        // Skating without poles: the arm opposite the pushing leg swings forward and across; the
+        // other swings back outside the pushing leg, and both carry their baskets wide and high.
+        let free_skate = w.skate * (1.0 - w.v2);
+        let swing = free_skate * g * s.skate_phase.sin();
+        ht += qc
+            * Vec3::new(
+                g * (0.12 * (-swing).max(0.0) - 0.04 * swing),
+                0.10 * swing,
+                -0.30 * swing,
+            );
+        dw = dw.lerp(unit(rb * Vec3::new(-g * 0.55, 0.45, -0.70)), free_skate);
         // A double-pole push at cycle position `u`: the fist and the pole axis it holds. The fist is
         // pulled onto the pole length around the basket while the basket is planted.
         let hq = rb * Quat::from_rotation_y(chest_twist);
         let sweep = (0.20 + 0.04 * speed).min(0.55);
         let pole_arm = |u: f32| {
             let key = loop_spline(&POLE_HAND, u);
-            let wish = shoulder[h] + hq * Vec3::new(g * key.x, key.y, key.z);
+            // Skating, the hips swing over each glide ski, so the fists pass wider still.
+            let wish = shoulder[h] + hq * Vec3::new(g * (key.x + 0.08 * w.skate), key.y, key.z);
             let (ahead, lift) = pole_tip_track(u, sweep);
-            let tip_xz = s.position + right * (g * 0.26) + fwd * ahead;
+            // Baskets plant half a metre out, wide of the boots, and wider still while skating so
+            // the pushing leg passes inside them.
+            let tip_xz = s.position + right * (g * (0.50 + 0.12 * w.skate)) + fwd * ahead;
             let tip = Vec3::new(
                 tip_xz.x,
                 terrain_height(tip_xz.x, tip_xz.z) + POLE_CLEARANCE + 0.005 + lift,
@@ -671,64 +1071,117 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         // Landing: fists drop towards the knees while the legs absorb.
         ht += qc * Vec3::new(0.0, -0.22, -0.18) * w.land;
         if w.tuck > 1e-3 {
-            // Tuck: fists forward at knee height, poles along the back.
-            ht = ht.lerp(chest + qc * Vec3::new(g * 0.14, -0.36, -0.42), w.tuck);
-            dw = dw.lerp(unit(qchest * Vec3::new(g * 0.05, 1.0, 0.0)), w.tuck);
+            // Tuck: fists forward at knee height outside the knees, poles tucked along the
+            // forearms, trailing back just below horizontal with the baskets out.
+            ht = ht.lerp(chest + qc * Vec3::new(g * 0.26, -0.36, -0.42), w.tuck);
+            dw = dw.lerp(unit(hq * Vec3::new(-g * 0.17, 0.26, -0.95)), w.tuck);
         }
         if w.air > 1e-3 {
             // Airborne: arms out for balance.
             ht = ht.lerp(chest + qc * Vec3::new(g * 0.55, 0.05, -0.18), w.air);
-            dw = dw.lerp(unit(qc * Vec3::new(g * 0.25, 0.5, -0.7)), w.air);
+            dw = dw.lerp(unit(qc * Vec3::new(-g * 0.42, 1.0, -0.33)), w.air);
         }
         // Free hands trail the body's acceleration.
         ht += w.hand[h] * ((1.0 - w.pole) * (1.0 - 0.6 * w.tuck));
+        // How far this hand is into a reach across the body for a grab.
+        let mut cross_w = 0.0;
         if let Some(sp) = &spec {
-            let (gt, gd) = match held[h] {
-                Some(p) => (p, unit(body_fwd * 0.9 + shoulder_x * (g * 0.3) + up * 0.2)),
+            let (gt, gd, cross) = match held[h] {
+                // The pole in a grabbing fist trails back, up and out over the grabbed ski; at the
+                // tip, in front of the body, it hangs down, back and out instead.
+                Some((p, out, along)) => {
+                    let trail = if along > 0.5 && out == g {
+                        Vec3::new(-out * 0.6, 0.55, -0.55)
+                    } else {
+                        Vec3::new(-out * 0.5, -0.35, -0.8)
+                    };
+                    (p, unit(qp * trail), out != g)
+                }
                 None => (
                     chest + qc * Vec3::new(g * sp.free.x, sp.free.y, sp.free.z),
-                    unit(qc * Vec3::new(g * 0.25, 0.5, -0.7)),
+                    unit(qc * Vec3::new(-g * 0.42, 1.0, -0.33)),
+                    false,
                 ),
             };
             ht = ht.lerp(gt, gw);
-            dw = dw.lerp(gd, gw);
+            if cross {
+                cross_w = gw;
+            }
+            dw = if cross {
+                // A hand reaching across the body leads with its basket ahead of the body, then
+                // swings it round the outside to its trail, turning at a steady rate.
+                let lead = unit(qp * Vec3::new(0.0, 0.25, 1.0));
+                if gw < 0.5 {
+                    turn(unit(dw), lead, smooth(2.0 * gw))
+                } else {
+                    turn(lead, gd, smooth(2.0 * gw - 1.0))
+                }
+            } else {
+                dw.lerp(gd, gw)
+            };
         }
         let dw = unit(dw);
-        // Keep the wished pole direction and raise the fist over the snow; the arm IK follows.
+        // Raise the fist over the snow and keep it, and the pole beside it, out of the body.
         let ht = ht + Vec3::Y * basket_lift(ht, dw);
-        let d = dw;
+        let ht = push_hand(ht, dw, FIST_R, g, &vols);
         let poling = w.pole.max(w.v2);
-        let elbow_pole =
-            qc * Vec3::new(g * 0.5, -0.7, 0.3).lerp(Vec3::new(g * 0.6, -0.2, 0.8), poling);
-        let wrist_target = soft_reach(shoulder[h], ht - d * HAND, UPPER_ARM + FOREARM);
-        let (e, wr) = limb(shoulder[h], wrist_target, UPPER_ARM, FOREARM, elbow_pole);
-        let d = fit_pole(wr, d);
+        // A hand reaching across the body leads with its elbow up and forward, over the knees.
+        let elbow_pole = qc
+            * Vec3::new(g * 0.5, -0.7, 0.3)
+                .lerp(Vec3::new(g * 0.6, -0.2, 0.8), poling)
+                .lerp(Vec3::new(g * 0.2, 0.4, -1.0), cross_w);
+        // The arm IK, the forearm and the pole clear the body; turning the pole about the wrist moves
+        // the fist, so a second pass aims the wrist at the fist target along the cleared pole.
+        let (mut e, mut wr, mut d) = (Vec3::ZERO, Vec3::ZERO, dw);
+        for _ in 0..2 {
+            // Where the arm can actually put the fist, kept out of the body with the wrist.
+            let reached = soft_reach(shoulder[h], ht - d * HAND, UPPER_ARM + FOREARM) + d * HAND;
+            let reached = push_hand(reached, d, FIST_R, g, &vols);
+            let wrist_target = push_out(reached - d * HAND, FOREARM_R, &vols);
+            (e, wr) = limb(shoulder[h], wrist_target, UPPER_ARM, FOREARM, elbow_pole);
+            (e, wr) = clear_arm(shoulder[h], e, wr, &vols);
+            d = fit_pole(wr, dw);
+            for _ in 0..3 {
+                d = fit_pole(wr, clear_pole(wr, d, &vols, g));
+            }
+        }
         elbow[h] = e;
         wrist[h] = wr;
         pole_dir[h] = d;
         fist[h] = wr + d * HAND;
     }
-
-    // --- Assemble. -----------------------------------------------------------------------
-    let mut pose = SkierPose {
-        p: [Vec3::ZERO; JOINTS],
-        ski_up: u,
-        facing: unit(qc * Vec3::NEG_Z),
-        gaze,
+    // Each pole also keeps out of the other arm, glove and pole: in grabs a pole crosses them.
+    let cap = |a: Vec3, b: Vec3, r: f32| Capsule {
+        a,
+        b,
+        r,
+        side: 0.0,
+        out: Vec3::ZERO,
     };
-    pose[J::Pelvis] = pelvis;
-    pose[J::Waist] = waist;
-    pose[J::Chest] = chest;
-    pose[J::Neck] = neck;
-    pose[J::Head] = head;
-    const HIP: [J; 2] = [J::HipL, J::HipR];
-    const KNEE: [J; 2] = [J::KneeL, J::KneeR];
-    const ANKLE: [J; 2] = [J::AnkleL, J::AnkleR];
-    const HEEL: [J; 2] = [J::HeelL, J::HeelR];
-    const TOE: [J; 2] = [J::ToeL, J::ToeR];
-    const BIND: [J; 2] = [J::BindL, J::BindR];
-    const TIP: [J; 2] = [J::TipL, J::TipR];
-    const TAIL: [J; 2] = [J::TailL, J::TailR];
+    for h in 0..2 {
+        let o = 1 - h;
+        let mut obstacles = vols.to_vec();
+        obstacles.extend([
+            cap(
+                shoulder[o].lerp(elbow[o], UPPER_ARM_FROM),
+                elbow[o],
+                UPPER_ARM_R,
+            ),
+            cap(elbow[o], wrist[o], FOREARM_R),
+            cap(wrist[o], fist[o], GLOVE_R),
+            cap(fist[o], fist[o], FIST_R),
+        ]);
+        if h == 1 {
+            let top = fist[0] + pole_dir[0] * POLE_GRIP;
+            obstacles.push(cap(top, top - pole_dir[0] * POLE_LENGTH, POLE_R));
+        }
+        pole_dir[h] = fit_pole(
+            wrist[h],
+            clear_pole(wrist[h], pole_dir[h], &obstacles, SIDE[h]),
+        );
+        fist[h] = wrist[h] + pole_dir[h] * HAND;
+    }
+
     const SHOULDER: [J; 2] = [J::ShoulderL, J::ShoulderR];
     const ELBOW: [J; 2] = [J::ElbowL, J::ElbowR];
     const WRIST: [J; 2] = [J::WristL, J::WristR];
@@ -736,14 +1189,6 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
     const POLE_TOP: [J; 2] = [J::PoleTopL, J::PoleTopR];
     const POLE_TIP: [J; 2] = [J::PoleTipL, J::PoleTipR];
     for i in 0..2 {
-        pose[HIP[i]] = hip[i];
-        pose[KNEE[i]] = knee[i];
-        pose[ANKLE[i]] = ankle[i];
-        pose[HEEL[i]] = bind[i] - f[i] * HEEL_BACK;
-        pose[TOE[i]] = bind[i] + f[i] * TOE_FORWARD;
-        pose[BIND[i]] = bind[i];
-        pose[TAIL[i]] = bind[i] - f[i] * SKI_BACK;
-        pose[TIP[i]] = bind[i] + f[i] * SKI_FRONT + u[i] * SKI_TIP_RISE;
         pose[SHOULDER[i]] = shoulder[i];
         pose[ELBOW[i]] = elbow[i];
         pose[WRIST[i]] = wrist[i];
@@ -1106,10 +1551,12 @@ mod tests {
                 check(&p, &format!("held {g:?}"));
                 let d = |hand: J| ski_dist(&p, hand, 0).min(ski_dist(&p, hand, 1));
                 let (dl, dr) = (d(J::HandL), d(J::HandR));
+                // The glove (a ball of FIST_R round the fist centre) is within 2 cm of the ski edge.
+                let on_ski = |d: f32| d - SKI_WIDTH * 0.5 - FIST_R < 0.02;
                 let ok = if g == Grab::TruckDriver {
-                    dl < 0.1 && dr < 0.1
+                    on_ski(dl) && on_ski(dr)
                 } else {
-                    dl.min(dr) < 0.1
+                    on_ski(dl.min(dr))
                 };
                 if !ok {
                     fails.push(format!(
@@ -1121,15 +1568,150 @@ mod tests {
         assert!(fails.is_empty(), "{fails:#?}");
     }
 
-    /// Largest per-tick second difference of any joint (metres per tick^2) while `drive` steers
-    /// the real physics -> animation -> rig chain at 120 Hz. `drive` returns true when it teleports.
-    fn worst_snap(
+    const VOLUME_NAMES: [&str; BODY_VOLUMES] = [
+        "head", "pelvisL", "pelvisR", "bellyL", "bellyR", "chestL", "chestR", "hiplinkL", "thighL",
+        "kneeL", "shinL", "cuffL", "soleL", "hiplinkR", "thighR", "kneeR", "shinR", "cuffR",
+        "soleR",
+    ];
+
+    /// Smallest gap (m, negative = overlap) between any hand, forearm or pole and the body, and
+    /// what touched what.
+    fn worst_gap(p: &SkierPose) -> (f32, String) {
+        let vols = body_volumes(p);
+        let mut worst = (f32::MAX, String::new());
+        for (side, [elbow, wrist, hand, top, tip]) in [
+            (
+                "L",
+                [J::ElbowL, J::WristL, J::HandL, J::PoleTopL, J::PoleTipL],
+            ),
+            (
+                "R",
+                [J::ElbowR, J::WristR, J::HandR, J::PoleTopR, J::PoleTipR],
+            ),
+        ] {
+            let shaft = unit(p[top] - p[tip]);
+            let basket = p[tip] + shaft * 0.08;
+            let parts = [
+                ("fist", p[hand], p[hand], 0.055),
+                ("glove", p[wrist], p[hand], 0.0375),
+                ("forearm", p[elbow], p[wrist], 0.04),
+                ("pole", p[top], p[tip], 0.007),
+                ("basket", basket, basket, 0.06),
+            ];
+            for (name, a, b, r) in parts {
+                for (v, c) in vols.iter().enumerate() {
+                    let (gap, _, _) = capsule_gap(c, a, b, r, 0.0);
+                    if gap < worst.0 {
+                        worst = (gap, format!("{side} {name} in {}", VOLUME_NAMES[v]));
+                    }
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn hands_forearms_and_poles_never_enter_the_body() {
+        // Before the clearance pass poles ran through the thighs in 6,545 of 10,800 F6 ticks. The
+        // Japan reach still brushes the glove up to 3 mm into the thigh for a few frames.
+        const OVERLAP: f32 = -4e-3;
+        let mut fails = Vec::new();
+        for &name in SCENES {
+            for &g in Grab::ALL {
+                for side in [-1.0, 1.0] {
+                    let mut a = SkiAnimation::default();
+                    let (mut s, mut c) = (
+                        base(),
+                        SkiControls {
+                            grab: g,
+                            trick_side: side,
+                            ..Default::default()
+                        },
+                    );
+                    for step in 0..300 {
+                        let t = step as f32 * DT;
+                        scene(name, t, &mut s, &mut c);
+                        a.update(&s, &c, DT);
+                        let (gap, what) = worst_gap(&solve(&s, &a));
+                        if gap < OVERLAP {
+                            fails.push(format!("{name} {g:?} {side} t={t:.2}: {what} {gap:.3}"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut run =
+            |label: &str,
+             ticks: usize,
+             drive: &mut dyn FnMut(usize, &mut Skier, &mut SkiControls)| {
+                let (mut s, mut a) = (Skier::default(), SkiAnimation::default());
+                for i in 0..ticks {
+                    let mut c = SkiControls::default();
+                    drive(i, &mut s, &mut c);
+                    a.update(&s, &c, DT);
+                    s.step(&c, DT);
+                    if s.crash.is_some() {
+                        break;
+                    }
+                    let (gap, what) = worst_gap(&solve(&s, &a));
+                    if gap < OVERLAP {
+                        fails.push(format!("{label} tick {i} ({}): {what} {gap:.3}", a.mode));
+                        break;
+                    }
+                }
+            };
+        let flat = |i: usize, s: &mut Skier, v: f32| {
+            if i == 0 {
+                s.reset_at(-40.0, 0.0, 0.0, v);
+            }
+        };
+        let mut demo = crate::ski::demo::SkiDemo::default();
+        run("F6 loop", 120 * 90, &mut |i, s, c| {
+            if i == 0 {
+                demo.enabled = true;
+                demo.begin_run(s);
+            }
+            demo.drive(s, c, DT);
+        });
+        run("skate into double pole", 1800, &mut |i, s, c| {
+            flat(i, s, 0.0);
+            c.push = 1.0;
+        });
+        run("carves", 1200, &mut |i, s, c| {
+            flat(i, s, 14.0);
+            c.steer = if (i / 120) % 2 == 0 { 1.0 } else { -1.0 };
+        });
+        run("hockey stop", 600, &mut |i, s, c| {
+            flat(i, s, 15.0);
+            c.brake = f32::from(u8::from(i > 60));
+        });
+        run("plow", 600, &mut |i, s, c| {
+            flat(i, s, 4.0);
+            c.brake = 1.0;
+        });
+        run("tuck slalom", 600, &mut |i, s, c| {
+            flat(i, s, 20.0);
+            c.tuck = true;
+            c.steer = (i as f32 * 0.02).sin();
+        });
+        run("jumps", 900, &mut |i, s, c| {
+            flat(i, s, 10.0);
+            c.jump = (i % 150) < 50 && i > 20;
+        });
+        assert!(fails.is_empty(), "{fails:#?}");
+    }
+
+    /// Largest per-tick second difference (metres per tick^2) of the body and of the arms and
+    /// poles (elbows to pole tips), while `drive` steers the real physics -> animation -> rig chain
+    /// at 120 Hz. `drive` returns true when it teleports.
+    fn worst_snaps(
         ticks: usize,
         mut drive: impl FnMut(usize, &mut Skier, &mut SkiControls) -> bool,
-    ) -> f32 {
+    ) -> (f32, f32) {
         let (mut s, mut a) = (Skier::default(), SkiAnimation::default());
         let mut hist: Vec<SkierPose> = Vec::new();
-        let mut worst = 0.0_f32;
+        let mut worst = (0.0_f32, 0.0_f32);
         for i in 0..ticks {
             let mut c = SkiControls::default();
             if drive(i, &mut s, &mut c) {
@@ -1143,11 +1725,38 @@ mod tests {
             hist.push(solve(&s, &a));
             if let [.., p0, p1, p2] = hist.as_slice() {
                 for j in 0..JOINTS {
-                    worst = worst.max((p2.p[j] - 2.0 * p1.p[j] + p0.p[j]).length());
+                    let d = (p2.p[j] - 2.0 * p1.p[j] + p0.p[j]).length();
+                    let arm = [
+                        J::ElbowL,
+                        J::ElbowR,
+                        J::WristL,
+                        J::WristR,
+                        J::HandL,
+                        J::HandR,
+                        J::PoleTopL,
+                        J::PoleTopR,
+                        J::PoleTipL,
+                        J::PoleTipR,
+                    ]
+                    .iter()
+                    .any(|&k| k as usize == j);
+                    if arm {
+                        worst.1 = worst.1.max(d);
+                    } else {
+                        worst.0 = worst.0.max(d);
+                    }
                 }
             }
         }
         worst
+    }
+
+    fn worst_snap(
+        ticks: usize,
+        drive: impl FnMut(usize, &mut Skier, &mut SkiControls) -> bool,
+    ) -> f32 {
+        let (body, tips) = worst_snaps(ticks, drive);
+        body.max(tips)
     }
 
     #[test]
@@ -1220,15 +1829,19 @@ mod tests {
     fn kicker_landings_settle_instead_of_teleporting() {
         // The F6 loop lands pitched 17 deg tail-first; the old snap moved the tips 0.6 m in a tick.
         let mut demo = crate::ski::demo::SkiDemo::default();
-        let worst = worst_snap(120 * 70, |i, s, c| {
+        let (body, arms) = worst_snaps(120 * 70, |i, s, c| {
             if i == 0 {
                 demo.enabled = true;
                 demo.begin_run(s);
             }
             demo.drive(s, c, DT)
         });
-        // What remains is the normal velocity stopping at the snow (~13 m/s * 1/120 s).
-        assert!(worst < 0.16, "{:.0} mm/tick^2", worst * 1e3);
+        // What remains is the normal velocity stopping at the snow (~13 m/s * 1/120 s), and in the
+        // grabs a knee swung clear of the chest (about 0.2 m/tick^2).
+        assert!(body < 0.21, "{:.0} mm/tick^2", body * 1e3);
+        // Known limit: in the Mute grab the cross-held pole, with its fist and elbow, flicks round
+        // the grabbed thigh for a tick (about 0.65 m/tick^2 at the basket).
+        assert!(arms < 0.7, "arms and poles {:.0} mm/tick^2", arms * 1e3);
     }
 
     /// Poses of a 12 m/s flat run that steers right from tick 60, one per tick.

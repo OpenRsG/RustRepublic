@@ -70,6 +70,9 @@ suspension, power, grip and look.
 - **Air:** jumps with a preload crouch and pop, free-rotation spins and flips, and nine
   grabs (Mute, Safety, Japan, Tail, Tip, Truck Driver, Daffy, Spread Eagle, Iron Cross).
 - **Landings:** wide-stance absorb and a short skid.
+- **Crashes:** a rigid-body skier with human joint ranges and self-collision that keeps
+  limbs out of each other and the body to within a few millimetres. Joints break past
+  their strength, bindings release at high loads, and the HUD lists what broke.
 
 **Both**:
 - **Crashes:** a bad landing, a hard impact or a body strike throws the rider into an

@@ -194,8 +194,17 @@ impl SkiView<'_> {
         } else if !focused {
             "FOCUS LOST - click to ride".to_string()
         } else if let Some(c) = s.crash {
+            let mut hurt = String::new();
+            if !self.ragdoll.injuries().is_empty() {
+                hurt += &format!(" | broke {}", self.ragdoll.injuries().join(", "));
+            }
+            match self.ragdoll.skis_off() {
+                0 => {}
+                1 => hurt += " | a ski came off",
+                _ => hurt += " | both skis came off",
+            }
             format!(
-                "CRASHED: {} at {:.1} m/s - R to reset",
+                "CRASHED: {} at {:.1} m/s{hurt} - R to reset",
                 c.reason.label(),
                 c.impact
             )
