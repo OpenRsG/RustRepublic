@@ -161,7 +161,7 @@ F6 and immediately turn it off.
 
 `src/animation.rs` blends posture and independent hand/foot/bike trick layers at
 120 Hz; `src/scene.rs` solves both visible geometry and collision proxies.
-These are **authored poses inspired by observed retail names**, not decoded clips.
+These are **authored poses inspired by observed retail names**; only Superman and tailwhip timing is measured from decoded clips (below).
 
 | Layer | Implemented families |
 | --- | --- |
@@ -205,14 +205,31 @@ riding poses. There is no rider/bike self-collision; extreme tricks can intersec
 
 The HUD shows selected versus active layers and any priority override:
 - Tricks start only airborne, after the first 0.05 s.
-- New holds stop 0.45 s before predicted wheel contact; rider release/regrab and
-  bar/tail/crank completion prepare the landing. Short flights may have no safe trick window.
+- New holds stop 0.45 s before predicted wheel contact (0.75 s for Superman, 0.65 s for
+  tailwhip); rider release/regrab and bar/tail/crank completion prepare the landing. Short
+  flights may have no safe trick window. Hands and feet regrab in about 0.3 s, faster when
+  contact is closer than that.
 - Barspin owns the bars and suppresses table, X-up and Euro table.
 - Invert, Euro table and crankflip force feet clear; an explicit foot trick
   still determines their pose.
-- Bar/tail/crank animations finish a revolution or unwind before contact. Their
-  timing remains authored assistance. **Root flips/rolls are not completed for you**;
-  an incorrect attitude or unfinished physical rotation can crash.
+- Bar/tail/crank spins that are moving always finish forward, easing out, rather than
+  reversing. Their timing remains authored assistance. **Root flips/rolls are not completed
+  for you**; an incorrect attitude or unfinished physical rotation can crash.
+
+Superman and tailwhip timing follows measurements of the decoded retail clips
+(`ID07_PS05_AIR_UNGRAB_SUPERMAN_*`, `ID05_PS05_AIR_UNGRAB_TAILWHIP_*`); the poses are ours.
+- Superman: the feet leave at once, and the straight legs swing from the pedals to straight
+  back over 0.1–0.45 s. The body lies flat behind the bars, arms straightening from 0.2 s,
+  while the bike swings nose-up under the gripped bars to about 90 degrees (easing out over
+  1.1 s). The pose is levelled against the bike's physical pitch, so the body stays flat in
+  the world. The return takes 0.63 s: bike and body swing back first, the knees fold (peak
+  about 150 degrees) and the feet come down onto the pedals last, easing out.
+- Tailwhip: the trick-side foot kicks out and back over the passing rear wheel first; the
+  other foot follows 0.1 s later and goes across and forward. The rider sinks behind the
+  bars with the trunk nearly upright. The frame spins at about 720 degrees/s. On release it
+  keeps turning forward, then eases out; the catch starts 100 degrees before the frame comes
+  round, with the trick-side foot back in about 0.2 s, the other in about 0.4 s, and the
+  rider lunging forward over the bars.
 
 Observed but **not implemented as separate trick families**: Bikeflip, Briflip,
 HDflip, Grizzair, Cannonball and Tsunami. Retail walk-back, dismount, menu/taunt,

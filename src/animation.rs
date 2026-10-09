@@ -10,15 +10,17 @@
 //!
 //! Name-derived families: OneHand, NoHand, TuckNoHand, Barspin, TireGrab, SeatGrab, Toboggan;
 //! OneFoot, NoFoot, CanCan, NoFootCan, Superman, Tailwhip, NacNac, Indian; Whip, Table, XUp,
-//! Turndown, EuroTable, Invert, Crankflip. Poses are authored from the trick names; the retail
-//! animation tracks are not decoded, so parity is unverified. Not implemented: BIKEFLIP, BRIFLIP,
-//! HDFLIP, GRIZZAIR, CANONBALL, TSUNAMI and any PS/discipline binding.
+//! Turndown, EuroTable, Invert, Crankflip. Poses are authored from the trick names. Superman and
+//! tailwhip timing (release order, swing, return and catch) is tuned against measurements of the
+//! decoded retail clips; the poses are ours, so parity is unverified. Not implemented: BIKEFLIP,
+//! BRIFLIP, HDFLIP, GRIZZAIR, CANONBALL, TSUNAMI and any PS/discipline binding.
 //!
 //! Priority rules (encoded in [`AnimationState::update`], reported through `note`):
 //! 1. Air-only: tricks are refused on the ground and during the first `AIR_MIN` seconds of flight.
-//! 2. Landing: new holds stop `REGRAB_LEAD` s before the predicted contact; hands/feet regrab and
-//!    bar/tail/crank spins finish their revolution (or unwind) before contact. Nothing else is
-//!    corrected for the landing: body rotation is whatever the physics produced.
+//! 2. Landing: new holds stop `regrab_lead` s before the predicted contact (longer for Superman
+//!    and tailwhip, whose returns take longer); hands/feet regrab and bar/tail/crank spins finish
+//!    their revolution (or unwind) before contact. Nothing else is corrected for the landing: body
+//!    rotation is whatever the physics produced.
 //! 3. Barspin owns the front assembly: Table, X-up and Euro table are suppressed while it runs.
 //! 4. Invert, Euro table and Crankflip force both feet off the pedals; an explicit `LegTrick` keeps
 //!    authority over the leg pose (the forced leg pose is used only when the leg trick is `None`).
@@ -38,23 +40,34 @@ const MAX_DT: f32 = 1.0 / 15.0;
 /// Seconds of flight before air-only tricks may start.
 const AIR_MIN: f32 = 0.05;
 /// Tricks stop being held, and limbs regrab, this long before the predicted contact.
-pub(crate) const REGRAB_LEAD: f32 = 0.45;
+const REGRAB_LEAD: f32 = 0.45;
 /// Hands/feet always head back to the bike once contact is this close.
 const LAST_REGRAB: f32 = 0.18;
 /// A finishing spin keeps hands/feet free until this many radians remain.
 const BUSY_OWED: f32 = 0.8;
+/// A finishing tailwhip starts the foot catch this many radians before the frame comes round.
+const TAIL_CATCH: f32 = 1.75;
 /// Spins aim to be complete this long before contact.
 const LAND_MARGIN: f32 = 0.15;
 const RELEASE_OMEGA: f32 = 19.0;
-const REGRAB_OMEGA: f32 = 38.0;
+/// Hands/feet back onto grips/pedals in about 0.3 s; faster when contact is closer than that.
+const REGRAB_OMEGA: f32 = 16.0;
+/// Tailwhip catch: the trick-side foot is back in about 0.2 s, the other in about 0.4 s.
+const CATCH_NEAR_OMEGA: f32 = 22.0;
+const CATCH_FAR_OMEGA: f32 = 12.0;
 const WEIGHT_OMEGA: f32 = 19.0;
+/// Superman: stretch-out clock limit and return duration, s.
+const SUP_IN: f32 = 1.1;
+const SUP_OUT: f32 = 0.63;
+/// The bike swings nose-up about the gripped bars while the rider lies flat, rad.
+const SUP_PITCH: f32 = 1.55;
 const SPIN_ACCEL: f32 = 14.0;
 const SETTLE: f32 = 0.01;
 const MIN_FINISH_RATE: f32 = 3.0;
 const RECOVER_RATE: f32 = 12.0;
 const MAX_FINISH_RATE: f32 = 32.0;
 const BAR_RATE: f32 = 16.0;
-const TAIL_RATE: f32 = 11.0;
+const TAIL_RATE: f32 = 12.6;
 const CRANK_RATE: f32 = 13.0;
 const LAND_IN: f32 = 20.0;
 const LAND_OUT: f32 = 12.0;
@@ -132,8 +145,8 @@ const LEG_BODY: [(f32, f32); LEG_KINDS] = [
     (0.0, 0.0),
     (0.0, 0.0),
     (0.0, 0.0),
-    (0.1, 0.75),
-    (0.2, 0.0),
+    (0.0, 0.0),
+    (2.0, 0.6),
     (0.0, 0.2),
     (0.1, 0.3),
     (-0.05, 0.5),
@@ -171,6 +184,16 @@ fn bike_index(t: BikeTrick) -> Option<usize> {
     BIKE_REPORT.iter().position(|&k| k == t)
 }
 
+/// Holds stop this long before contact so the return fits: Superman's return takes `SUP_OUT`,
+/// and a tailwhip's second foot is caught about 0.4 s after the frame comes round.
+fn regrab_lead(leg: LegTrick) -> f32 {
+    match leg {
+        LegTrick::Superman => SUP_OUT + 0.12,
+        LegTrick::Tailwhip => 0.65,
+        _ => REGRAB_LEAD,
+    }
+}
+
 /// Critically damped spring (exact step): `x` reaches `target` without overshoot and with
 /// continuous velocity `v`, so a changing target never snaps the pose. `omega` is rad/s.
 fn spring(x: &mut f32, v: &mut f32, target: f32, omega: f32, dt: f32) {
@@ -206,15 +229,10 @@ impl Spin {
         self.angle == 0.0 && self.rate == 0.0
     }
 
-    /// Direction in which the spin will finish: on with the current rotation when it is already
-    /// more than ~30% of a turn along, otherwise back the short way.
+    /// Direction in which the spin will finish: on with the rotation while it is moving (a kicked
+    /// frame or thrown bar never reverses), otherwise back the short way.
     fn dir(&self) -> f32 {
-        let fwd = if self.rate >= 0.0 {
-            TAU - self.angle
-        } else {
-            self.angle
-        };
-        if self.rate.abs() > 0.5 && fwd <= 1.4 * PI {
+        if self.rate.abs() > 0.5 {
             self.rate.signum()
         } else if self.angle < PI {
             -1.0
@@ -254,7 +272,8 @@ impl Spin {
             return;
         }
         let dir = self.dir();
-        let mut r = self.rate.abs().max(MIN_FINISH_RATE).min(owed * 10.0 + 1.0);
+        // Ease out: each 1/30 s removes about 40% of what is left (retail tailwhip catch).
+        let mut r = self.rate.abs().max(MIN_FINISH_RATE).min(owed * 15.0 + 1.0);
         if grounded {
             r = r.max(RECOVER_RATE);
         } else {
@@ -374,6 +393,23 @@ pub(crate) struct BikeLayer {
     pub grip_slide: f32,
 }
 
+/// Superman channels, each 0..1 (see [`AnimationState::superman`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Superman {
+    /// Straight legs swung from just ahead of straight down to straight back.
+    pub legs: f32,
+    /// Bike swung nose-up about the gripped bars.
+    pub bike: f32,
+    /// Arms straightened to full reach.
+    pub arms: f32,
+    /// Body laid flat behind the bars.
+    pub body: f32,
+    /// Knees folded on the way back to the pedals.
+    pub fold: f32,
+    /// Bike nose-up pitch (rad) the pose is levelled against, so the body lies flat in the world.
+    pub level: f32,
+}
+
 /// Spring velocities for the smoothed weights and posture values of [`AnimationState`].
 #[derive(Clone, Copy, Debug, Default)]
 struct Rates {
@@ -444,6 +480,12 @@ pub(crate) struct AnimationState {
     pub bars: Spin,
     pub tail: Spin,
     pub crank: Spin,
+    /// Superman clocks: seconds into the stretch (held during the return) and 0..1 return progress.
+    pub sup_t: f32,
+    pub sup_u: f32,
+    sup_level: f32,
+    /// Seconds the tailwhip has been requested.
+    tail_t: f32,
     /// Spring velocities of the smoothed values above.
     rate: Rates,
 }
@@ -487,6 +529,10 @@ impl Default for AnimationState {
             bars: Spin::default(),
             tail: Spin::default(),
             crank: Spin::default(),
+            sup_t: 0.0,
+            sup_u: 0.0,
+            sup_level: 0.0,
+            tail_t: 0.0,
             rate: Rates::default(),
         }
     }
@@ -511,6 +557,32 @@ impl AnimationState {
             && self.hand_rel == [0.0; 2]
             && self.foot_rel == [0.0; 2]
             && self.spins().iter().all(|s| s.settled())
+            && self.sup_t == 0.0
+    }
+
+    /// Superman pose channels, from the retail clip timings: feet off at once, the straight legs
+    /// swing back over 0.1–0.45 s, arms straighten from 0.2 s and the bike keeps swinging nose-up
+    /// (easing out) until `SUP_IN`. The return (`SUP_OUT`) swings the bike and body back first,
+    /// folds the knees early and puts the feet down last.
+    pub fn superman(&self) -> Superman {
+        let t = self.sup_t;
+        if t == 0.0 {
+            return Superman::default();
+        }
+        let ease = |a: f32, b: f32| {
+            let x = ((t - a) / (b - a)).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let u = self.sup_u;
+        let stay = (1.0 - u) * (1.0 - u);
+        Superman {
+            legs: ease(0.10, 0.45),
+            bike: ((t / SUP_IN).min(1.0) * FRAC_PI_2).sin() * stay,
+            arms: ((t - 0.2) / 0.47).clamp(0.0, 1.0) * stay,
+            body: ease(0.0, 0.2) * stay,
+            fold: (PI * u.sqrt()).sin(),
+            level: self.sup_level,
+        }
     }
 
     pub fn body(&self) -> Body {
@@ -545,9 +617,13 @@ impl AnimationState {
     pub fn bike_layer(&self) -> BikeLayer {
         let (w, s) = (&self.bike_w, self.side);
         let table_t = (w[B_TABLE] + w[B_EURO]).min(1.0);
+        let sup = self.superman();
         BikeLayer {
             roll: s * (0.30 * w[B_WHIP] + 1.35 * w[B_TABLE] + 1.45 * w[B_EURO]),
-            pitch: -(0.9 * w[B_TURN] + 2.35 * w[B_INVERT]),
+            pitch: -(0.9 * w[B_TURN] + 2.35 * w[B_INVERT])
+                + (SUP_PITCH - sup.level)
+                    * sup.bike
+                    * (1.0 - 0.5 * (self.hand_rel[0] + self.hand_rel[1])),
             yaw: s * (0.30 * w[B_WHIP] + 0.35 * w[B_TURN] + 0.30 * w[B_EURO]),
             bar_turn: s * (0.94 * FRAC_PI_2 * table_t + 0.92 * PI * w[B_XUP]),
             table_t,
@@ -568,7 +644,7 @@ impl AnimationState {
         let grounded = i.grounded[0] || i.grounded[1];
         let air = !grounded && i.air_time >= AIR_MIN;
         let lead = if air { i.landing_in } else { 0.0 };
-        let free = air && lead > REGRAB_LEAD;
+        let free = air && lead > regrab_lead(c.leg_trick);
 
         // Landing impact is captured from the prediction while still airborne, then kicks the
         // compression spring on the first contact frame.
@@ -639,7 +715,7 @@ impl AnimationState {
         }
 
         // Feet.
-        let tail_busy = !self.tail.settled() && self.tail.owed() > BUSY_OWED && lead > LAST_REGRAB;
+        let tail_busy = !self.tail.settled() && self.tail.owed() > TAIL_CATCH && lead > LAST_REGRAB;
         let crank_busy =
             !self.crank.settled() && self.crank.owed() > BUSY_OWED && lead > LAST_REGRAB;
         let mut leg_want = [false; LEG_KINDS];
@@ -654,6 +730,15 @@ impl AnimationState {
                 [1.0; 2]
             };
         }
+        // Tailwhip: the trick-side foot leaves first, the other once the rear is swinging round.
+        self.tail_t = if leg_req == LegTrick::Tailwhip {
+            self.tail_t + dt
+        } else {
+            0.0
+        };
+        if leg_req == LegTrick::Tailwhip && self.tail_t < 0.1 {
+            leg_t[1 - si] = 0.0;
+        }
         let forced = match bike_req {
             BikeTrick::Invert => Some(L_DANGLE),
             BikeTrick::EuroTable => Some(L_COUNTER),
@@ -666,7 +751,7 @@ impl AnimationState {
                 leg_want[k] = true;
             }
         }
-        if tail_busy {
+        if tail_busy && leg_req != LegTrick::Tailwhip {
             leg_t = [1.0; 2];
             leg_want[L_TAIL] = true;
         }
@@ -675,6 +760,25 @@ impl AnimationState {
             if leg_req == LegTrick::None {
                 leg_want[L_LIFT] = true;
             }
+        }
+        // Superman runs on its clip clocks; the return always plays out, quicker if contact is near.
+        self.sup_level = i.pitch.clamp(-0.7, 0.7);
+        if leg_req == LegTrick::Superman && self.sup_u == 0.0 {
+            self.sup_t = (self.sup_t + dt).min(SUP_IN);
+        } else if self.sup_t > 0.0 {
+            let left = if air {
+                (lead - LAND_MARGIN).max(0.05)
+            } else {
+                0.2
+            };
+            self.sup_u += dt * (1.0 / SUP_OUT).max((1.0 - self.sup_u) / left);
+            if self.sup_u >= 1.0 {
+                (self.sup_t, self.sup_u) = (0.0, 0.0);
+            }
+        }
+        if self.sup_t > 0.0 {
+            leg_t = [1.0; 2];
+            leg_want[L_SUPER] = true;
         }
 
         // Bike.
@@ -743,21 +847,44 @@ impl AnimationState {
                 dt,
             );
         }
+        // Regrabs speed up when contact is closer than they take.
+        let late = if air { (5.0 / lead).min(60.0) } else { 38.0 };
+        let tail_catch = self.leg_w[L_TAIL] > 0.02;
         for s in 0..2 {
             let omega = if hand_t[s] > self.hand_rel[s] {
                 RELEASE_OMEGA
             } else {
-                REGRAB_OMEGA
+                REGRAB_OMEGA.max(late)
             };
             let (x, v) = (&mut self.hand_rel[s], &mut self.rate.hand_rel[s]);
             weight(x, v, hand_t[s], omega, dt);
+            let regrab = match (tail_catch, s == si) {
+                (true, true) => CATCH_NEAR_OMEGA,
+                (true, false) => CATCH_FAR_OMEGA,
+                _ => REGRAB_OMEGA,
+            };
             let omega = if leg_t[s] > self.foot_rel[s] {
-                RELEASE_OMEGA
+                // A tailwhip kick takes the feet off fast.
+                if leg_want[L_TAIL] {
+                    30.0
+                } else {
+                    RELEASE_OMEGA
+                }
             } else {
-                REGRAB_OMEGA
+                regrab.max(late)
             };
             let (x, v) = (&mut self.foot_rel[s], &mut self.rate.foot_rel[s]);
             weight(x, v, leg_t[s], omega, dt);
+        }
+        // Superman return: the feet come down onto the pedals last, easing out.
+        if self.sup_u > 0.0 {
+            let off = 1.0 - (self.sup_u * FRAC_PI_2).sin();
+            for s in 0..2 {
+                if self.foot_rel[s] > off {
+                    self.foot_rel[s] = off;
+                    self.rate.foot_rel[s] = 0.0;
+                }
+            }
         }
 
         // Body posture targets (additive terms), then smoothing.
@@ -787,6 +914,12 @@ impl AnimationState {
             crouch = 0.7 - 0.95 * ext - 0.5 * takeoff;
             back = c.air_pitch * 0.5;
             lateral = -c.air_roll * 0.06;
+            // Tailwhip catch: lunge forward over the bars as the frame comes round.
+            let catch = (!self.tail.settled()
+                && leg_req != LegTrick::Tailwhip
+                && self.tail.owed() < TAIL_CATCH) as u8 as f32;
+            back -= 0.9 * catch;
+            stand += 0.3 * catch;
         } else {
             stand = if sprint {
                 1.0

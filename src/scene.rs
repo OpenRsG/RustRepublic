@@ -17,7 +17,7 @@ use std::ops::{Index, IndexMut};
 pub(crate) use crate::animation::AnimationState;
 use crate::animation::{
     H_BAR, H_NO, H_ONE, H_SEAT, H_TIRE, H_TOBO, H_TUCK, HAND_KINDS, L_CAN, L_COUNTER, L_DANGLE,
-    L_INDIAN, L_LIFT, L_NAC, L_NO, L_NOCAN, L_ONE, L_SUPER, L_TAIL, LEG_KINDS,
+    L_INDIAN, L_LIFT, L_NAC, L_NO, L_NOCAN, L_ONE, L_SUPER, L_TAIL, LEG_KINDS, Superman,
 };
 use crate::bike::{
     Bike, CollisionPose, CollisionSphere, Discipline, SUSPENSION_REST, WHEEL_RADIUS, WHEELBASE,
@@ -286,7 +286,7 @@ fn arm_free(k: usize, s: f32, sh: Vec3, hover: Vec3, tire: Vec3, seat: Vec3) -> 
 }
 
 /// Ankle target of a released leg for pose kind `k`; `sigma` is the trick side.
-fn leg_free(k: usize, s: f32, sigma: f32, hip: Vec3, hj: Vec3) -> Vec3 {
+fn leg_free(k: usize, s: f32, sigma: f32, hip: Vec3, hj: Vec3, sup: &Superman) -> Vec3 {
     let near = s * sigma; // +1 on the trick side
     match k {
         L_ONE => hj + unit(0.85 * s, -0.35, -0.15) * (LEG_REACH * 0.95),
@@ -299,8 +299,17 @@ fn leg_free(k: usize, s: f32, sigma: f32, hip: Vec3, hj: Vec3) -> Vec3 {
                 -0.28 + 0.10 * near,
             )
         }
-        L_SUPER => hj + unit(0.12 * s, 0.12, 1.0) * (LEG_REACH * 0.95),
-        L_TAIL => hj + Vec3::new(0.10 * s, -0.20, -0.32),
+        // Straight legs swing at the hip from just ahead of straight down to straight back; the
+        // knees fold on the way back to the pedals.
+        L_SUPER => {
+            let phi = -0.23 + (1.89 + sup.level) * sup.legs;
+            hj + unit(0.08 * s, -phi.cos(), phi.sin())
+                * ((THIGH + SHIN) * 0.99 * (1.0 - 0.15 * sup.fold))
+        }
+        // Both feet go to the trick side: the near one up and back over the passing rear wheel,
+        // the other across and forward, nearly straight.
+        L_TAIL if near > 0.0 => hip + Vec3::new(0.62 * sigma, -0.05, 0.14),
+        L_TAIL => hip + Vec3::new(0.58 * sigma, -0.15, -0.50),
         L_NAC => hj + Vec3::new(-0.20 * s, -0.02, 0.62),
         L_INDIAN => hj + unit(0.60 * s, -0.15, 0.55) * (LEG_REACH * 0.9),
         L_DANGLE => hj + Vec3::new(0.05 * s, -0.80, 0.05),
@@ -603,6 +612,35 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         }
         None => Quat::IDENTITY,
     };
+    // Released feet leave the pelvis free to follow the shoulders. Keeping it pinned to the
+    // saddle during Superman/table combinations would stretch the spine.
+    let free_feet = (a.foot_rel[0] + a.foot_rel[1]) * 0.5;
+    // Superman: the body lies flat behind the gripped bars (trunk 75–81 degrees from vertical,
+    // shoulders just above the wrists), arms straightening, while the bike swings under the bars.
+    let sup = a.superman();
+    let flat = sup.body * (1.0 - released);
+    if flat > 0.0 {
+        let w = (wrist_att[0] + wrist_att[1]) * 0.5;
+        let lat = ((wrist_att[1].x - wrist_att[0].x).abs() * 0.5 - SHOULDER_HALF).max(0.0);
+        let arm = 0.47 + 0.08 * sup.arms;
+        let s_t = w + Vec3::new(0.0, 0.10, (arm * arm - 0.01 - lat * lat).max(0.0).sqrt());
+        let tr = 1.31 + 0.10 * sup.legs + sup.level;
+        let h_t = s_t + Vec3::new(0.0, -tr.cos(), tr.sin()) * TORSO;
+        shoulder = shoulder.lerp(s_t, flat);
+        hip = hip.lerp(h_t, flat);
+    }
+    // Tailwhip: the rider sinks behind the bars with the trunk nearly upright while the frame
+    // spins under him.
+    let whip = a.leg_w[L_TAIL] * free_feet;
+    if whip > 0.0 {
+        shoulder.y -= 0.08 * whip;
+        let up = (shoulder - hip)
+            .try_normalize()
+            .unwrap_or(Vec3::Y)
+            .lerp(Vec3::Y, 0.6)
+            .normalize();
+        hip = hip.lerp(shoulder - up * TORSO, whip);
+    }
     // At full steer lock or a whip one grip swings away: pull the shoulders into reach of the
     // attached hands (torso stretches a few cm) rather than detaching a hand.
     let arm_max = (UPPER_ARM + FOREARM) * 0.985;
@@ -615,9 +653,6 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
             }
         }
     }
-    // Released feet leave the pelvis free to follow the shoulders. Keeping it pinned to the
-    // saddle during Superman/table combinations would stretch the spine.
-    let free_feet = (a.foot_rel[0] + a.foot_rel[1]) * 0.5;
     let torso_dir = (shoulder - hip).try_normalize().unwrap_or(Vec3::Y);
     hip = hip.lerp(shoulder - torso_dir * TORSO, free_feet);
     r[P::Hip] = hip;
@@ -626,9 +661,10 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     let fwd = (-(shoulder - hip).normalize().z).clamp(-0.3, 1.0);
     // Head stays level and looking ahead: it keeps little of the torso's roll and lean, and
     // nods against the torso's acceleration lag.
-    r[P::Neck] = shoulder + Vec3::new(0.0, 0.07, -0.02);
+    r[P::Neck] = shoulder + Vec3::new(0.0, 0.07, -0.02).lerp(Vec3::new(0.0, 0.03, -0.08), flat);
     r[P::Neck].x *= 0.7;
-    r[P::Head] = shoulder + Vec3::new(0.0, 0.145, -0.06 - 0.05 * fwd);
+    r[P::Head] = shoulder
+        + Vec3::new(0.0, 0.145, -0.06 - 0.05 * fwd).lerp(Vec3::new(0.0, 0.05, -0.18), flat);
     r[P::Head].x *= 0.4;
     r.head_rot = Quat::from_rotation_z(-0.8 * body.turn)
         * Quat::from_rotation_x(0.55 * fwd - 0.05 + 0.8 * body.surge);
@@ -643,22 +679,27 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
             for k in 0..LEG_KINDS {
                 let w = a.leg_w[k];
                 if w > 0.0 {
-                    acc += leg_free(k, s, a.side, hip, hj) * w;
+                    acc += leg_free(k, s, a.side, hip, hj, &sup) * w;
                     sum += w;
                 }
             }
             if sum > 1e-3 {
                 acc / sum
             } else {
-                leg_free(L_DANGLE, s, a.side, hip, hj)
+                leg_free(L_DANGLE, s, a.side, hip, hj, &sup)
             }
         };
         let ankle_t = ankle_att[i].lerp(free_ankle, a.foot_rel[i]);
         let inside = (-s * body.turn / 0.4).clamp(0.0, 1.0);
+        // Superman legs fold with the knees down, under the hip-ankle line.
         let knee_pole = Vec3::new(
             s * (0.3 + 0.9 * inside + 0.3 * body.crouch.max(0.0)),
             0.2,
             -1.0,
+        )
+        .lerp(
+            Vec3::new(0.2 * s, -1.0, -0.3),
+            a.leg_w[L_SUPER] * a.foot_rel[i],
         );
         let (knee, ankle) = limb(hj, ankle_t, THIGH, SHIN, knee_pole);
         let shin = (ankle - knee).try_normalize().unwrap_or(Vec3::NEG_Y);
@@ -1814,7 +1855,8 @@ mod tests {
     use crate::bike::{BikeTrick, Controls, HandTrick, LegTrick};
 
     const DT: f32 = 1.0 / 30.0;
-    const FLIGHT: f32 = 1.1;
+    /// Long enough for the slowest return (Superman) to start after the mid-flight sample.
+    const FLIGHT: f32 = 1.5;
 
     /// One solved frame: finite joints, exact bone lengths, limbs fully on the bike reach their
     /// grips/pedals (hands may cost the torso a few cm of stretch, hence the looser tolerance).
@@ -2741,6 +2783,72 @@ mod tests {
                 lo[6],
                 hi[6],
                 (hi[7] - lo[7]) * 0.5
+            );
+        }
+    }
+
+    /// Superman and tailwhip returns play out instead of snapping back: the Superman feet take
+    /// about 0.6 s to reach the pedals, a released tailwhip frame keeps turning the way it was
+    /// kicked, and its trick-side foot is caught before the other. Both are done by contact.
+    #[test]
+    fn superman_and_tailwhip_returns_take_their_time() {
+        let (dt, flight, hold) = (1.0 / 120.0, 2.2, 1.2);
+        let wrap = |x: f32| (x + PI).rem_euclid(TAU) - PI;
+        for l in [LegTrick::Superman, LegTrick::Tailwhip] {
+            let mut a = AnimationState::default();
+            let (mut t, mut start, mut caught) = (0.0_f32, None, [None; 2]);
+            let mut prev = 0.0;
+            while t < flight {
+                let c = Controls {
+                    leg_trick: if t < hold { l } else { LegTrick::None },
+                    trick_side: -1.0,
+                    ..Controls::default()
+                };
+                a.update(
+                    &Input {
+                        c,
+                        ride_stand: 0.5,
+                        speed: 8.0,
+                        vy: 0.0,
+                        pitch: 0.0,
+                        steering: 0.0,
+                        roll: 0.0,
+                        suspension: [0.05; 2],
+                        crank_phase: 0.0,
+                        grounded: [false; 2],
+                        air_time: t,
+                        landing_in: flight - t,
+                        impact: 3.0,
+                    },
+                    dt,
+                );
+                t += dt;
+                let turn = wrap(a.tail.angle - prev);
+                prev = a.tail.angle;
+                if t > hold {
+                    assert!(turn <= 1e-4, "{l:?}: the frame reversed at {t:.3}");
+                    let returning = a.foot_rel.iter().any(|&f| f < 0.98);
+                    start = start.or(returning.then_some(t));
+                    for s in 0..2 {
+                        if a.foot_rel[s] < 0.02 {
+                            caught[s] = caught[s].or(Some(t));
+                        }
+                    }
+                }
+            }
+            let (start, near, far) = (start.unwrap(), caught[0].unwrap(), caught[1].unwrap());
+            if l == LegTrick::Superman {
+                assert!(
+                    (0.5..0.7).contains(&(near - start)),
+                    "Superman return {}",
+                    near - start
+                );
+            } else {
+                assert!(far - near > 0.1, "tailwhip catch {near:.3} / {far:.3}");
+            }
+            assert!(
+                a.tail.settled() && a.sup_t == 0.0,
+                "{l:?}: unfinished at contact"
             );
         }
     }
