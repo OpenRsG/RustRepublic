@@ -26,6 +26,11 @@ Each profile has authored spring/damper, power, drag, tire grip, hop and air-con
 settings. Bars, saddle height, tire width, frame and jersey colors change too;
 Road has narrow drop grips, smooth tires and a visually rigid frame/fork.
 All four retain the shared wheel radius, wheelbase and bounded two-strut contact model.
+Each tyre has one grip budget (`GROUND_MU` 0.65 × strut load) shared by drive, brake and
+cornering; demand beyond it stays as sideways slip, and a front tyre overloaded and sliding
+for 0.5 s is a `Washout` crash. Above 6 m/s steering sets a target lean (roll rate limited)
+and yaw follows `g·tan(lean)/v` minus a countersteer term, so the bars dip the other way
+first; below 3 m/s the bars steer kinematically, blended in between.
 The fixed 120 Hz simulation supports pedaling, sprinting, braking, steering/lean,
 hops, wheelies, rear-wheel manuals, nose manuals and physical flips, rolls and yaw spins.
 Wheel spin, drivetrain and suspension movement feed the same animated rig.
@@ -120,13 +125,18 @@ with momentum and ordinary collision tests—not independent visual layers.
 ### Browser (WebGPU)
 
 ```sh
-scripts/web.sh   # writes target/www: index.html, JS glue, 24 MB wasm
+scripts/web.sh   # writes target/www: index.html, JS glue, wasm and a gzipped copy (~8 MB)
 ```
 
 Needs the `wasm32-unknown-unknown` standard library (Arch: `rust-wasm`) and
 `wasm-bindgen-cli` at the `wasm-bindgen` version in `Cargo.lock`
 (`cargo install --locked wasm-bindgen-cli --version 0.2.129`). It uses the `web` profile
-(size-optimised, stripped). The page needs WebGPU, so serve it over HTTPS or `localhost`.
+(opt-level 3, thin LTO, stripped): the physics runs at full speed and gzip keeps the
+download near 8 MB. `wasm-opt -O3` runs when binaryen is on `PATH` or unpacked under
+`.tools/binaryen/`. The page fetches `rider-rep-rust_bg.wasm.gz` and unpacks it with
+`DecompressionStream` while a progress bar shows the stage and bytes, falling back to the
+plain wasm without that API. It also resumes the sound's `AudioContext` on the first
+pointer or key press. The page needs WebGPU, so serve it over HTTPS or `localhost`.
 It opens in ski mode with the F6 showcase looping and keeps running without focus;
 click the canvas to use the keys. WebGL is not built. On portrait screens the camera keeps a
 4:3 horizontal field of view (vertical FOV up to 100 degrees, `hor_plus` in `src/game.rs`)
@@ -152,7 +162,7 @@ serves it at `https://<host>.<tailnet>.ts.net:8443/`. Rebuilding updates it in p
 
 Press **5** for a skier; **1–4** return to the bike. The code is in `src/ski/` and was written for this project. It is not decoded retail behaviour.
 - Skeleton (`pose.rs`): 23 body joints plus ski tail/binding/upturned tip and pole top/tip, with fixed bone lengths. Segment lengths, hip and shoulder width and the 0.366 m ski stance follow the decoded retail rider rig's proportions; the ski is 1.5 m, longer than the 1.26 m between the retail ski end bones. F1/F2 and the overlay colours work the same as for the bike.
-- Physics (`physics.rs`, 120 Hz): slope gravity, snow friction, drag with a lighter tuck, sidecut carving and edge grip, skidding, skating (below 4 m/s), double-poling, snowplow and hockey stop, and switch riding. Hold Space to crouch and release to jump; the legs absorb landings. In the air you get free-quaternion spins and flips. Landings are judged before any penetration is corrected: a bad angle, crossed skis or too much spin, a hard impact, a body strike, or a caught edge is a crash.
+- Physics (`physics.rs`, 120 Hz): slope gravity, snow friction, drag with a lighter tuck, sidecut carving (radius `SIDECUT_RADIUS`·cos edge, fading in from about 3 to 23 degrees of edge) and edge grip, skidding once v²/R exceeds the grip, skating (below 4 m/s), double-poling, snowplow and hockey stop, and switch riding. Hold Space to crouch and release to jump; the legs absorb landings. In the air you get free-quaternion spins and flips. Landings are judged before any penetration is corrected: a bad angle, crossed skis or too much spin, a hard impact, a body strike, or a caught edge is a crash.
 - Animation (`anim.rs`, `rig.rs`): athletic stance, carve inclination and angulation with knee drive, tuck, plow with knees in, hockey stop, V-skate and double-pole with stride rates that rise with speed, jump preload, landing absorption, and switch stance. Grabs: Mute, Safety, Japan, Tail, Tip, Truck Driver, Daffy, Spread Eagle and Iron Cross. Grabs release about 0.35 s before the predicted landing. Blend weights are springs, so poses never snap between ticks; a touchdown eases the pose from its in-air attitude onto the snow over about 0.15 s. The drawn skier and camera are interpolated between the 120 Hz physics ticks.
 - Secondary motion: breathing and slow weight shifts, a chest that lags the skis' turn (counter-rotation), a head that stays level and keeps looking downhill, free hands that trail the body's acceleration, a deep preload crouch whose arms swing back before the pop, a race tuck with the back about 25 degrees above horizontal and fists at the knees, a touchdown that reaches its deepest point about 0.2 s after contact (torso folded about 65 degrees, wider stance, brief visual skid across the line of travel) and is back near neutral about 0.5 s later, and an inside-pole plant at each carve change. Timings and postures were tuned against retail reference video, clip durations and decoded retail air/ollie curves, not copied from retail data.
 - Flat ground: skating is a stroke cycle. On each stroke one ski edges and pushes out and back while the hips cross over to the other ski; the pushing ski then lifts, swings in and lands as the next stroke begins. Both skis sit about 12 degrees off the travel line, a V of roughly 23 degrees with the tails close. The skier travels along the ski it glides on, so that ski never slides, and the body weaves slightly as the weight moves. The pushing foot ends about 0.5 m from the glide foot with a nearly straight leg; the glide knee is flexed 50–60 degrees, with the trunk leaning 30–40 degrees forward over it. Strokes take about 0.95 s from standstill and 0.6 s at 4 m/s, and start short and upright. From about 2 m/s the poles push on every stroke (V2); below that it is free skate with the arms swinging across. Double poling runs a cycle of 1.2 s down to 0.9 s, faster with speed: poles plant ahead of the binding, the trunk crunches from near upright to about 55 degrees off vertical with the hips and knees flexing in step, and the hands finish past the hips. Speed is gained only in the push window of each stroke or cycle. No retail footage of skating or poling exists, so these follow real cross-country technique rather than a game reference.
@@ -183,21 +193,29 @@ The checks use terrain normals, actual posed wheel centres/axles and angular rat
 
 A crashed bike ignores riding inputs and falls, bounces, slides and tumbles with
 gravity, friction and angular impulses. The detached rider inherits linear/angular
-momentum and limb motion from the impact pose. Mass-weighted bone constraints,
-bounded joints and passive joint friction keep the ragdoll articulated; joint
-spheres and sampled bone capsules collide with the shared terrain. The hands keep hold
+momentum and limb motion from the impact pose. It is 15 rigid capsule segments on the
+XPBD solver shared with the ski ragdoll (`src/rigid.rs`), with anatomical joint limits,
+collision between every non-jointed pair (limb vs limb and limb vs bike frame and tyres)
+and the bike as a coupled 14 kg body: grips and contacts push the wreck through
+`Bike::push`. The hands keep hold
 of the bars and the feet stay on the pedals until the wreck pulls harder than they can
 hold (600 N per hand, 200 N per flat-pedal foot, sustained for 20 ms): a slow topple keeps
 the rider attached to the bike for a moment, while a hard impact tears hands and feet away
-at once. The HUD reports "let go of the bars" / "feet off the pedals".
+at once (grips are detachable joints with those strengths). The HUD reports "let go of
+the bars" / "feet off the pedals".
 Penetration repair is separate from contact velocity, so getting out of the floor
 does not launch the rider. Resting bodies sleep instead of continually jittering.
-The crash persists until **R**, except that F6 explicitly resets between runs.
+Outside the F6 showcase the rider gets up where they fell once the ragdoll sleeps or
+after 3 s (`GETUP_TIMEOUT`): bike or skis are placed upright at rest under the hip, and
+the drawn pose blends from the ragdoll to the riding pose over 0.7 s (`GETUP_BLEND`,
+smoothstep) with controls ignored. **R** still returns to the start; F6 resets between
+runs. A ski or pole thrown far lerps back to the feet during the blend.
 Pause/focus loss freezes both bodies; reset restores riding and clears the ragdoll.
 
 These are proxy contacts, not triangle-perfect collisions or retail ragdoll tracks.
-Rider–bike contacts use frame/wheel proxies and currently push the rider only;
-limb self-collision is not simulated. Extreme airborne poses can intersect.
+The crashed bike has no friction inside the rider solver (its own crash model keeps tyre
+and ground friction) and feels the rider one step late. The spine is one joint.
+Extreme airborne poses while riding can still intersect.
 
 ## F6 hill showcase
 

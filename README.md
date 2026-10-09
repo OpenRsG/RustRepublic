@@ -39,7 +39,10 @@ scripts/web.sh        # builds target/www (index.html + JS + wasm)
 Serve `target/www` over HTTPS or `localhost`, for example with `tailscale serve`,
 `python -m http.server` or any static host, and open it in a recent Chrome, Edge or
 Safari. You need the `wasm32-unknown-unknown` target and
-`wasm-bindgen-cli 0.2.129`, the same version as in `Cargo.lock`.
+`wasm-bindgen-cli 0.2.129`, the same version as in `Cargo.lock`. The build is optimized
+for speed; `wasm-opt` (binaryen) runs when found on `PATH` or under `.tools/binaryen/`, and
+a gzipped copy (about 8 MB) is written next to the wasm. The page downloads that copy and
+unpacks it in the browser, with a progress bar, so no server compression is needed.
 
 The page opens straight into the looping ski showcase. A ☰ menu (top right) switches
 between ski and the four bikes, starts either showcase, picks tricks, and toggles pause,
@@ -58,7 +61,11 @@ bones, mesh, key help, touch controls and fullscreen.
 **Bike**: four disciplines (Downhill, Road, Slopestyle, Freeride), each with its own
 suspension, power, grip and look.
 - **Physics:** a fixed 120 Hz two-wheel model with pedalling, sprinting, braking,
-  wheelies and manuals. Land a flip on one wheel and you have to balance it with the
+  wheelies and manuals. Each tyre has one grip budget shared by drive, braking and
+  cornering, so braking hard in a turn slides, and a front tyre that slides for half a
+  second washes out. At speed you steer by leaning: the bars dip the other way first
+  (countersteer), then the bike turns with its lean; at walking pace the bars steer
+  directly. Land a flip on one wheel and you have to balance it with the
   arrows, or loop out or go over the bars.
 - **Rotations:** flips, barrel rolls and spins are the bike's actual momentum. There are
   no canned rotations, so you can under-rotate and crash. The rider leads them with head,
@@ -71,7 +78,8 @@ suspension, power, grip and look.
   bars; at top speed the rider drops low. Landings absorb through the arms and legs.
 
 **Ski**:
-- **Riding:** carving with angulation and upper/lower-body separation, hockey stops,
+- **Riding:** carving on the ski's sidecut (radius = sidecut × cos edge angle, so more
+  edge turns tighter; past the edge grip the turn skids), with angulation and upper/lower-body separation, hockey stops,
   snowplow, tuck and switch riding.
 - **Flat ground:** V-skating and double poling, with cadence and speed gain tied to each
   push.
@@ -86,7 +94,14 @@ suspension, power, grip and look.
 **Both**:
 - **Crashes:** a bad landing, a hard impact (too fast into the ground, or fast and
   off-angle) or a body strike throws the rider into an articulated ragdoll that keeps
-  the momentum. A bike rider holds on until the wreck pulls harder than hands and feet can.
+  the momentum. Both are rigid capsule limbs with human joint ranges and self-collision on
+  one shared solver. A bike rider holds on until the wreck pulls harder than hands and
+  feet can, and drags and shoves the bike while doing so.
+- **Getting up:** outside the showcase, once the body comes to rest (or after 3 s) the
+  rider stands up where they fell, blending back into the riding pose over 0.7 s.
+  R still returns to the start.
+- **Sound:** procedural, no audio files: wind with speed, tyre roll and skid, snow
+  carve and skid hiss, landing thuds and crash impacts. M mutes.
 - **Landings vary:** the body is thrown the way the touchdown came in, with a little
   per-landing randomness.
 - **Smooth motion:** the rendered pose blends between physics ticks, and every animation
@@ -115,7 +130,7 @@ suspension, power, grip and look.
 | Tricks | U/I/O pick hand/foot/bike trick · B hold · J/L side | U pick grab · B hold · J/L side |
 | Switch | 1–4 discipline · 5 ski | 1–4 back to bike |
 | Camera | Right-drag orbit · wheel zoom · C recenter (touch: drag / pinch) | same |
-| Other | F6 showcase · R reset · Esc pause · H help · F1/F2 skeleton views · F3 log state | same |
+| Other | F6 showcase · R reset · Esc pause · M sound · H help · F1/F2 skeleton views · F3 log state | same |
 
 ## How it works
 
@@ -123,7 +138,8 @@ suspension, power, grip and look.
 | --- | --- |
 | `src/bike.rs` | Bike dynamics, suspension, contact, crash detection |
 | `src/animation.rs`, `src/scene.rs` | Rider animation layers, two-bone IK rig, interpolated rendering |
-| `src/ragdoll.rs` | Rider ragdoll |
+| `src/ragdoll.rs`, `src/rigid.rs` | Bike rider ragdoll on the rigid-body solver shared with the ski ragdoll |
+| `src/audio.rs` | Procedural sound |
 | `src/ski/` | Skier physics, animation, rig, ragdoll, rendering, showcase |
 | `src/game.rs` | App setup, input, chase camera, HUD |
 | `src/showcase.rs` | Bike F6 script, driven through the normal controls |
