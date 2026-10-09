@@ -312,6 +312,10 @@ fn read_ski_controls(
 ) {
     let entered = *sport == Sport::Ski && *previous != Sport::Ski;
     *previous = *sport;
+    // The browser build opens straight into the looping showcase (browsers keep F-keys).
+    // Only the very first frame counts: switching away first means no showcase on return.
+    let autostart = cfg!(target_arch = "wasm32") && !*autostarted;
+    *autostarted = true;
     if *sport != Sport::Ski {
         demo.enabled = false;
         *controls = SkiControls::default();
@@ -324,9 +328,6 @@ fn read_ski_controls(
         ragdoll.reset();
         reset_camera(&mut chase, false);
     }
-    // The browser build opens straight into the looping showcase (browsers keep F-keys).
-    let autostart = cfg!(target_arch = "wasm32") && !*autostarted;
-    *autostarted = true;
     if autostart || status.focused && keys.just_pressed(KeyCode::F6) {
         demo.enabled = autostart || !demo.enabled;
         if demo.enabled {
