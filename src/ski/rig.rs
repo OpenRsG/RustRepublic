@@ -868,16 +868,21 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
     // twists to look the way it travels.
     let turn_twist = 0.45 * w.carve + w.counter + 0.6 * slip * w.skid
         - 0.85 * w.skid_side * LAND_SKID_YAW * w.land_skid;
-    let chest_twist = turn_twist + 1.6 * w.switch * w.switch_side;
+    // A held grab owns the arms and torso; the leading fades out while it holds.
+    let lead_w = 1.0 - smooth(3.0 * gw);
+    let [spin_lead, flip_lead, roll_lead] = w.english.map(|e| e * lead_w);
+    let chest_twist = turn_twist + 1.6 * w.switch * w.switch_side + spin_lead;
     let qp = roll_p * Quat::from_rotation_y(0.25 * chest_twist);
     // Angulation: the torso is inclined less than the hips; sway rolls it a little against them.
+    // In a roll the shoulders drop into it ahead of the hips.
     let qc = rb
-        * Quat::from_axis_angle(Vec3::NEG_Z, lean * 0.45 - 2.0 * sway)
+        * Quat::from_axis_angle(Vec3::NEG_Z, lean * 0.45 - 2.0 * sway + 0.35 * roll_lead)
         * Quat::from_rotation_y(chest_twist);
     // The head stays level and keeps looking down the hill while the chest twists and leans.
     let qh = qc.slerp(r * Quat::from_rotation_y(chest_twist), 0.6);
     let gaze = unit(
-        r * Quat::from_rotation_y(chest_twist - 0.6 * turn_twist - 0.2 * w.carve) * Vec3::NEG_Z,
+        r * Quat::from_rotation_y(chest_twist + 0.6 * spin_lead - 0.6 * turn_twist - 0.2 * w.carve)
+            * Vec3::NEG_Z,
     );
     let flex = (0.28
         + 0.30 * w.crouch
@@ -887,6 +892,7 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
         + 0.02 * breathe
         + 1.05 * w.tuck * (1.0 - 0.3 * w.air)
         + 0.35 * w.air_tuck
+        - 0.45 * flip_lead
         + 0.18 * tall
         + 0.78 * crunch
         + 0.10 * w.plow
@@ -1081,6 +1087,9 @@ pub(crate) fn solve(s: &Skier, a: &SkiAnimation) -> SkierPose {
             ht = ht.lerp(chest + qc * Vec3::new(g * 0.55, 0.05, -0.18), w.air);
             dw = dw.lerp(unit(qc * Vec3::new(-g * 0.42, 1.0, -0.33)), w.air);
         }
+        // Spinning, the arm on the outside of the turn sweeps across the chest to lead it and the
+        // other opens behind; the arms reach up in a backflip and down in a front flip.
+        ht += qc * Vec3::new(-0.2 * spin_lead, 0.12 * flip_lead, -0.25 * spin_lead * g) * w.air;
         // Free hands trail the body's acceleration.
         ht += w.hand[h] * ((1.0 - w.pole) * (1.0 - 0.6 * w.tuck));
         // How far this hand is into a reach across the body for a grab.

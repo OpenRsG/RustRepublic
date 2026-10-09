@@ -35,6 +35,10 @@ pub(super) struct Blend {
     pub tuck: f32,
     /// Knees pulled up while airborne.
     pub air_tuck: f32,
+    /// Air body English `[spin, flip, roll]`: chest and head leading a spin (+ left; wound up the
+    /// other way in the preload), torso thrown back for a backflip (+) or curled for a front
+    /// flip, shoulders dropped into a roll (+ right).
+    pub english: [f32; 3],
     /// Signed carve side, -1 left .. +1 right (counter-rotation / angulation).
     pub carve: f32,
     pub plow: f32,
@@ -92,6 +96,7 @@ pub(super) struct Rates {
     crouch: f32,
     tuck: f32,
     air_tuck: f32,
+    english: [f32; 3],
     carve: f32,
     preload: f32,
     extend: f32,
@@ -296,6 +301,22 @@ impl SkiAnimation {
         // The chest lags the skis' turn: counter-rotation builds at a turn entry and relaxes.
         let counter = (-COUNTER_LAG * s.angular_velocity.y).clamp(-0.35, 0.35) * ground;
         spring(&mut w.counter, &mut r.counter, counter, 8.0, dt);
+
+        // Body English: shoulders and head lead a rotation and keep leading it, the hips and
+        // skis follow. Before a pop the chest winds up against the coming spin.
+        let rates = s.rotation.inverse() * s.angular_velocity;
+        let english = if airborne {
+            [
+                (-0.35 * c.air_yaw + 0.06 * rates.y).clamp(-0.6, 0.6),
+                (0.5 * c.air_pitch + 0.08 * rates.x).clamp(-1.0, 1.0),
+                (0.5 * c.air_roll - 0.06 * rates.z).clamp(-0.8, 0.8),
+            ]
+        } else {
+            [0.3 * c.air_yaw * w.preload, 0.0, 0.0]
+        };
+        for k in 0..3 {
+            spring(&mut w.english[k], &mut r.english[k], english[k], 10.0, dt);
+        }
 
         // Free hands are damped masses on the body: they trail its acceleration (not gravity).
         if w.clock == 0.0 {

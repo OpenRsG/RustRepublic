@@ -311,6 +311,10 @@ pub(crate) struct Input {
     pub landing_in: f32,
     /// Predicted downward speed at that contact, m/s.
     pub impact: f32,
+    /// Body-frame angular velocity, rad/s: pitch (+ nose up), yaw (+ left), roll (+ left).
+    pub pitch_rate: f32,
+    pub yaw_rate: f32,
+    pub roll_rate: f32,
 }
 
 impl Input {
@@ -330,6 +334,9 @@ impl Input {
             air_time: b.air_time,
             landing_in,
             impact,
+            pitch_rate: b.pitch_rate,
+            yaw_rate: b.yaw_rate,
+            roll_rate: b.roll_rate,
         }
     }
 }
@@ -374,6 +381,8 @@ pub(crate) struct Body {
     pub steer: Option<f32>,
     /// 0..1 landing compression (arms and legs absorb).
     pub land: f32,
+    /// Air body English `[throw, twist, drop, tuck]`, see [`AnimationState::english`].
+    pub english: [f32; 4],
 }
 
 /// Bike-assembly motion relative to the rider, as angles (see `scene::rig` for the geometry).
@@ -429,6 +438,7 @@ struct Rates {
     surge: f32,
     crank: f32,
     steer: f32,
+    english: [f32; 4],
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -459,6 +469,10 @@ pub(crate) struct AnimationState {
     pub attack: f32,
     pub pump: f32,
     pub surge: f32,
+    /// Body English in the air: `[throw, twist, drop, tuck]`. Throw: head and shoulders thrown
+    /// back (+, backflip) or over the bars (-). Twist: shoulders and head leading a spin (+ left).
+    /// Drop: shoulder dropped into a barrel roll (+ left). Tuck: 0..1 bike pulled in to rotate.
+    pub english: [f32; 4],
     /// Drawn (spring-followed, unwrapped) crank angle and bar angle; `None` before the first
     /// update, when the bike's own are used.
     crank_un: f32,
@@ -512,6 +526,7 @@ impl Default for AnimationState {
             attack: 0.0,
             pump: 0.0,
             surge: 0.0,
+            english: [0.0; 4],
             crank_un: 0.0,
             crank_vis: 0.0,
             prev_crank: None,
@@ -608,6 +623,7 @@ impl AnimationState {
             pedal: self.pedal,
             surge: self.surge,
             sag: self.pump,
+            english: self.english,
             crank: self.prev_crank.map(|_| self.crank_vis),
             steer: self.steer_vis,
             land: self.land.clamp(0.0, 1.0),
@@ -977,6 +993,30 @@ impl AnimationState {
         spring(&mut self.pedal, &mut self.rate.pedal, pedal_on, 8.0, dt);
         spring(&mut self.attack, &mut self.rate.attack, attack, 6.0, dt);
         spring(&mut self.pump, &mut self.rate.pump, absorb, 24.0, dt);
+        // Body English: the rider throws head and shoulders the way the bike is asked to turn and
+        // keeps leading the rotation while it runs (shoulders and head first, the hips and bike
+        // follow), pulls the bike in to rotate, and opens up again to spot the landing.
+        let english = if grounded {
+            [0.0; 4]
+        } else {
+            let open = 1.0 - ext;
+            [
+                (0.6 * c.air_pitch + 0.08 * i.pitch_rate).clamp(-1.0, 1.0) * open,
+                (-0.35 * c.air_yaw + 0.06 * i.yaw_rate).clamp(-0.6, 0.6),
+                (-0.5 * c.air_roll + 0.07 * i.roll_rate).clamp(-0.8, 0.8) * open,
+                ((i.pitch_rate.abs() / 6.0).max(i.roll_rate.abs() / 8.0)).min(1.0) * open,
+            ]
+        };
+        for k in 0..4 {
+            let omega = if grounded { 8.0 } else { 11.0 };
+            spring(
+                &mut self.english[k],
+                &mut self.rate.english[k],
+                english[k],
+                omega,
+                dt,
+            );
+        }
         // Secondary motion: the torso lags the bike's longitudinal acceleration on a lightly
         // damped spring (accelerating pushes it back, braking throws it forward).
         let accel = match self.prev_speed {

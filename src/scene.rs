@@ -527,12 +527,14 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     // bike (the bike leans more than the rider).
     let sway = -body.pedal * (0.012 + 0.03 * body.stand) * r.crank.sin();
     let lean_x = 0.2 * body.turn;
+    let [throw, twist, drop, tuck] = body.english;
+    // Barrel roll: the hips counter the dropped shoulder; a tucked rotation sinks them.
     let mut hip = HIP_REST
         + SEAT_DIR * (look.post - 0.60)
         + Vec3::new(
-            body.lateral + lean_x + sway,
-            0.22 * body.stand - 0.11 * body.crouch - sag,
-            0.22 * body.back - 0.03 * body.stand,
+            body.lateral + lean_x + sway + 0.04 * drop,
+            0.22 * body.stand - 0.11 * body.crouch - sag - 0.07 * tuck,
+            0.22 * body.back - 0.03 * body.stand + 0.04 * throw,
         );
     {
         const K: f32 = 0.05;
@@ -596,6 +598,13 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     // Shoulders swing against the pelvis on a standing stroke; in a lean the torso stays more
     // upright than the bike (shoulders outboard of the pelvis).
     shoulder.x += 0.13 * body.turn - 1.6 * sway;
+    // Air body English: the shoulders drop into a barrel roll and lead a backflip (thrown back
+    // and up) or a front flip (over the bars); the arms bend to keep the grips.
+    shoulder += Vec3::new(
+        -0.12 * drop,
+        -0.04 * drop.abs() + 0.03 * throw,
+        0.07 * throw,
+    );
 
     // Shoulders follow the grip line (bars turned, whipped or tabled); modulo 180 degrees so an
     // x-up does not flip them, and fading out when the grips sit together.
@@ -612,6 +621,8 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         }
         None => Quat::IDENTITY,
     };
+    // A spin is led by the shoulders, turned ahead of the hips and the bike.
+    let sq = Quat::from_rotation_y(twist) * sq;
     // Released feet leave the pelvis free to follow the shoulders. Keeping it pinned to the
     // saddle during Superman/table combinations would stretch the spine.
     let free_feet = (a.foot_rel[0] + a.foot_rel[1]) * 0.5;
@@ -666,8 +677,12 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
     r[P::Head] = shoulder
         + Vec3::new(0.0, 0.145, -0.06 - 0.05 * fwd).lerp(Vec3::new(0.0, 0.05, -0.18), flat);
     r[P::Head].x *= 0.4;
-    r.head_rot = Quat::from_rotation_z(-0.8 * body.turn)
-        * Quat::from_rotation_x(0.55 * fwd - 0.05 + 0.8 * body.surge);
+    // The head leads every rotation: it turns into a spin ahead of the shoulders, tilts into a
+    // barrel roll and looks back for the landing in a backflip (down past the bars in a front
+    // flip).
+    r.head_rot = Quat::from_rotation_y(0.7 * twist)
+        * Quat::from_rotation_z(-0.8 * body.turn + 0.5 * drop)
+        * Quat::from_rotation_x(0.55 * fwd - 0.05 + 0.8 * body.surge + 0.6 * throw);
 
     // Limbs: attached target blended with the authored free pose by the release weight.
     let hover_lift = Vec3::new(0.0, 0.15, 0.0);
@@ -733,7 +748,11 @@ fn solve(b: &Bike, a: &AnimationState, rocking: bool) -> Rig {
         let wrist_t = wrist_att[i].lerp(free_wrist, a.hand_rel[i]);
         let inside = (-s * body.turn / 0.4).clamp(0.0, 1.0);
         let elbow_pole = Vec3::new(
-            s * (0.55 + 0.6 * body.crouch.clamp(0.0, 1.0) + 0.6 * inside),
+            s * (0.55
+                + 0.6 * body.crouch.clamp(0.0, 1.0)
+                + 0.6 * inside
+                + 0.5 * throw.max(0.0)
+                + 0.3 * tuck),
             0.25,
             0.55,
         );
@@ -2078,6 +2097,9 @@ mod tests {
                     air_time,
                     landing_in,
                     impact: 6.0,
+                    pitch_rate: 0.0,
+                    yaw_rate: 0.0,
+                    roll_rate: 0.0,
                 },
                 DT,
             );
@@ -2819,6 +2841,9 @@ mod tests {
                         air_time: t,
                         landing_in: flight - t,
                         impact: 3.0,
+                        pitch_rate: 0.0,
+                        yaw_rate: 0.0,
+                        roll_rate: 0.0,
                     },
                     dt,
                 );

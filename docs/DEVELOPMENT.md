@@ -26,6 +26,24 @@ Road has narrow drop grips, smooth tires and a visually rigid frame/fork.
 All four retain the shared wheel radius, wheelbase and bounded two-strut contact model.
 The fixed 120 Hz simulation supports pedaling, sprinting, braking, steering/lean,
 hops, wheelies, rear-wheel manuals, nose manuals and physical flips, rolls and yaw spins.
+
+On one wheel the rider balances the bike: Up/Down shift the rider's weight and give a limited
+pitch torque (4 rad/s²). Landing a flip on the rear wheel (or the nose) leaves the bike to its
+own momentum and gravity; past the balance point gravity soon outgrows the rider's torque, and
+beyond 72 degrees to the ground the rider loops out (or goes over the bars). The manual and nose
+manual assists only hold a balance the rider has already found: deeper than 0.2–0.4 rad past
+their target they let go. On one wheel the rider's legs and arms absorb a landing's impact, so
+only up to 1.5 g of the strut force pitches the bike and landing deep on a wheel no longer
+slams or launches it.
+
+In the air the rider uses body English. Head and shoulders are thrown back for a backflip (elbows
+flaring as the bars are pulled) or over the bars for a front flip. The shoulders drop into a
+barrel roll with the hips countering and the head tilted into it, and turn ahead of the hips to
+lead a spin with the head further still. The bike is pulled in while it rotates, and the body
+opens up to spot the landing. Skiers do the same: the chest and head lead a spin (wound up the
+other way in the preload), the outside arm sweeps across the chest while the other opens
+behind, the torso arches back into a backflip with the arms reaching up or curls for a front
+flip, and the shoulders drop into a roll; a held grab takes the arms and torso over.
 Wheel spin, drivetrain and suspension movement feed the same animated rig.
 
 The live skeleton overlay is enabled at launch and uses the same solved joints

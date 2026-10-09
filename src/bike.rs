@@ -82,6 +82,15 @@ const NOSE_PITCH: f32 = 0.4;
 const BALANCE_SPEED: (f32, f32) = (1.0, 3.0);
 const BALANCE_K: f32 = 60.0;
 const BALANCE_D: f32 = 14.0;
+/// The assist holds fully within the first pitch error (rad) and lets go by the second.
+const BALANCE_CAPTURE: (f32, f32) = (0.2, 0.4);
+/// Pitch acceleration the rider's weight shift gives on one wheel, rad/s^2 (+ nose up).
+const RIDER_BALANCE: f32 = 4.0;
+/// Pitch to the ground under the one grounded wheel past which the rider falls off: looped out
+/// backwards on the rear wheel, over the bars on the front, rad.
+const TIP_OVER_PITCH: f32 = 1.25;
+/// Strut force (in g) whose torque pitches a bike landing on one wheel; the rest is absorbed.
+const ONE_WHEEL_TORQUE_G: f32 = 1.5;
 
 // Air yaw: physical spin about the bike's own up axis.
 const AIR_YAW_ACCEL: f32 = 12.0;
@@ -294,6 +303,8 @@ pub enum CrashReason {
     FrameImpact,
     MissingSupport,
     HardImpact,
+    LoopedOut,
+    OverTheBars,
 }
 
 impl CrashReason {
@@ -304,6 +315,8 @@ impl CrashReason {
             Self::FrameImpact => "Frame impact",
             Self::MissingSupport => "Missing support",
             Self::HardImpact => "Hard impact",
+            Self::LoopedOut => "Looped out",
+            Self::OverTheBars => "Over the bars",
         }
     }
 }
@@ -956,7 +969,15 @@ impl Bike {
             force[i] = f;
             let push = f * Vec3::new(-k.slope.x, 1.0, -k.slope.y);
             accel += push;
-            torque += k.lever.cross(push);
+            // On one wheel the rider's legs and arms soak up a landing's impact: only up to
+            // `ONE_WHEEL_TORQUE_G` of the strut force pitches the bike, so landing deep on a
+            // wheel does not slam or launch it.
+            let share = if grounded[0] != grounded[1] {
+                (ONE_WHEEL_TORQUE_G * GRAVITY / f.max(1e-6)).min(1.0)
+            } else {
+                1.0
+            };
+            torque += k.lever.cross(push * share);
         }
         let inv = self.rot.inverse();
         let to_pitch = move |t: Vec3| (inv * t).x / GYRATION_SQ;
@@ -1038,12 +1059,25 @@ impl Bike {
             } else {
                 (0, -NOSE_PITCH)
             };
+            let ground_pitch = |i: usize| contacts[i].slope.dot(heading).atan();
             if balance && grounded[wheel] {
-                let ground = contacts[wheel].slope.dot(heading).atan();
-                let strength = smoothstep(BALANCE_SPEED.0, BALANCE_SPEED.1, v_f);
-                let servo =
-                    BALANCE_K * (ground + target - self.pitch) - BALANCE_D * self.pitch_rate;
+                // The assist only holds a balance the rider has already found: far from its
+                // target pitch (a flip landed deep on one wheel) it fades out, and the rider must
+                // first steer the bike back with the arrows.
+                let error = ground_pitch(wheel) + target - self.pitch;
+                // How far past the target, towards tipping over (behind for a manual, over the
+                // front for a nose manual); lifting into the balance from flat is always held.
+                let deep = (-error * target.signum()).max(0.0);
+                let strength = smoothstep(BALANCE_SPEED.0, BALANCE_SPEED.1, v_f)
+                    * (1.0 - smoothstep(BALANCE_CAPTURE.0, BALANCE_CAPTURE.1, deep));
+                let servo = BALANCE_K * error - BALANCE_D * self.pitch_rate;
                 pitch_acc += (servo - pitch_acc) * strength;
+            }
+            // On one wheel the rider balances the bike by moving their weight over or behind the
+            // contact wheel (up/down arrows): a limited torque, so past a critical angle gravity
+            // wins and the bike loops out or goes over the bars.
+            if grounded[0] != grounded[1] {
+                pitch_acc += RIDER_BALANCE * c.air_pitch;
             }
             self.yaw_rate = 0.0;
             if hop_edge {
@@ -1121,6 +1155,28 @@ impl Bike {
         for i in 0..2 {
             self.suspension[i] = contacts[i].compression.clamp(0.0, MAX_COMPRESSION);
             self.grounded[i] = contacts[i].compression > 0.0;
+        }
+        // One wheel down and pitched past the point of no return: the rider falls off.
+        if self.grounded[0] != self.grounded[1] {
+            let i = usize::from(self.grounded[1]);
+            let heading = Vec2::new(-self.yaw.sin(), -self.yaw.cos());
+            let rel = self.pitch - contacts[i].slope.dot(heading).atan();
+            let reason = if i == 1 && rel > TIP_OVER_PITCH {
+                Some(CrashReason::LoopedOut)
+            } else if i == 0 && rel < -TIP_OVER_PITCH {
+                Some(CrashReason::OverTheBars)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.crash = Some(Crash {
+                    reason,
+                    impact: 0.0,
+                    elapsed: 0.0,
+                });
+                self.crash_substep(0.0);
+                return;
+            }
         }
         self.air_time = if self.grounded[0] || self.grounded[1] {
             0.0
@@ -1942,7 +1998,50 @@ mod tests {
         }
     }
 
-    /// A bike launched 1.5 m up at 9 m/s, held in a flip and turned `turn` radians about its pitch
+    /// Lands on one wheel still rotating (1.5 rad/s) and rides on with the rider's balance input
+    /// `input` (applied while one wheel is down).
+    fn one_wheel_landing(pitch: f32, input: f32) -> Bike {
+        let mut b = Bike::default();
+        b.position.y += 1.2;
+        b.rot = Quat::from_rotation_x(pitch);
+        b.sync_attitude();
+        b.velocity = Vec3::new(0.0, 0.0, -6.0);
+        b.pitch_rate = 1.5 * pitch.signum();
+        for _ in 0..480 {
+            let one = b.grounded[0] != b.grounded[1];
+            let c = Controls {
+                air_pitch: if one { input } else { 0.0 },
+                ..Controls::default()
+            };
+            b.step(&c, DT);
+            if b.crash.is_some() {
+                break;
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn one_wheel_landings_must_be_balanced_or_they_tip_over() {
+        for (pitch, tip) in [
+            (0.6, CrashReason::LoopedOut),
+            (-0.6, CrashReason::OverTheBars),
+        ] {
+            let left = one_wheel_landing(pitch, 0.0);
+            assert_eq!(
+                left.crash.map(|c| c.reason),
+                Some(tip),
+                "{pitch} unbalanced"
+            );
+            let saved = one_wheel_landing(pitch, -f32::signum(pitch));
+            assert!(
+                saved.crash.is_none() && saved.grounded == [true; 2],
+                "{pitch} balanced: {:?}",
+                saved.crash
+            );
+        }
+    }
+
     /// axis by a bang-bang controller, then given 3 s in total.
     fn flip_flight(turn: f32) -> Bike {
         let mut b = Bike::default();
