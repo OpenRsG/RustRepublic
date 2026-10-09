@@ -161,7 +161,7 @@ F6 and immediately turn it off.
 
 `src/animation.rs` blends posture and independent hand/foot/bike trick layers at
 120 Hz; `src/scene.rs` solves both visible geometry and collision proxies.
-These are **authored poses inspired by observed retail names**; only Superman and tailwhip timing is measured from decoded clips (below).
+These are **authored poses inspired by observed retail names**, not decoded clips.
 
 | Layer | Implemented families |
 | --- | --- |
@@ -216,8 +216,7 @@ The HUD shows selected versus active layers and any priority override:
   reversing. Their timing remains authored assistance. **Root flips/rolls are not completed
   for you**; an incorrect attitude or unfinished physical rotation can crash.
 
-Superman and tailwhip timing follows measurements of the decoded retail clips
-(`ID07_PS05_AIR_UNGRAB_SUPERMAN_*`, `ID05_PS05_AIR_UNGRAB_TAILWHIP_*`); the poses are ours.
+Superman and tailwhip timing is tuned against measurements; the poses are ours.
 - Superman: the feet leave at once, and the straight legs swing from the pedals to straight
   back over 0.1–0.45 s. The body lies flat behind the bars, arms straightening from 0.2 s,
   while the bike swings nose-up under the gripped bars to about 90 degrees (easing out over
