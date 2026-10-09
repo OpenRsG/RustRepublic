@@ -1,4 +1,4 @@
-use crate::animation::Input as AnimationInput;
+use crate::animation::{GETUP_TIMEOUT, Input as AnimationInput, Rise};
 use crate::bike::{Bike, BikeTrick, Controls, Discipline, HandTrick, LegTrick, terrain_height};
 use crate::scene;
 use crate::showcase::{Showcase, Stage};
@@ -243,6 +243,7 @@ pub fn run() {
         .init_resource::<crate::ragdoll::Ragdoll>()
         .init_resource::<Showcase>()
         .add_plugins(crate::ski::SkiPlugin)
+        .add_plugins(crate::audio::SoundPlugin)
         .add_systems(Startup, (scene::setup_scene, setup_view))
         .add_systems(
             PreUpdate,
@@ -575,6 +576,28 @@ fn read_controls(
     }
 }
 
+/// Stands a crashed rider up on the spot once the ragdoll sleeps or `GETUP_TIMEOUT` has passed:
+/// the bike is placed upright under the ragdoll hip facing the crash heading, at rest, and the
+/// drawn rider then blends from the ragdoll pose to the riding pose (`AnimationState::rise`).
+fn stand_up(
+    bike: &mut Bike,
+    animation: &mut scene::AnimationState,
+    ragdoll: &mut crate::ragdoll::Ragdoll,
+) {
+    let (Some(crash), Some(body)) = (bike.crash, &ragdoll.body) else {
+        return;
+    };
+    if !(body.sleeping || crash.elapsed >= GETUP_TIMEOUT) {
+        return;
+    }
+    let from = body.positions;
+    let hip = from[crate::ragdoll::index(scene::P::Hip)];
+    bike.reset_facing(hip.x, hip.z, bike.yaw);
+    animation.reset();
+    animation.rise = Some(Rise::new(from));
+    ragdoll.reset();
+}
+
 fn simulate(
     time: Res<Time<Fixed>>,
     mut controls: ResMut<Controls>,
@@ -598,6 +621,13 @@ fn simulate(
         *chase = ChaseCamera::default();
         chase.distance = CAM_DEMO_DISTANCE;
     }
+    if let Some(rise) = &mut animation.rise {
+        rise.elapsed += dt;
+        input = Controls::default();
+        if rise.done() {
+            animation.rise = None;
+        }
+    }
     if bike.crash.is_none() {
         animation.update(&AnimationInput::from_bike(&bike, &input), dt);
     }
@@ -613,6 +643,9 @@ fn simulate(
             ragdoll.activate(seed);
         }
         ragdoll.step(&bike, dt);
+        if !showcase.enabled {
+            stand_up(&mut bike, &mut animation, &mut ragdoll);
+        }
     }
     if bike.crash.is_some() {
         animation.mode = "crashed";
@@ -1002,6 +1035,121 @@ mod tests {
         }
         assert_eq!(app.world().resource::<Bike>().position, position);
         assert_eq!(app.world().resource::<Bike>().velocity, velocity);
+    }
+
+    /// The real bike systems, a bike dropped 10 m onto flat ground at (-20, 8) (a hard-impact
+    /// crash 28 m from the course start) and the pedal held down throughout.
+    fn crashed_app() -> App {
+        let mut clock = Time::<Fixed>::from_hz(120.0);
+        clock.advance_by(Duration::from_secs_f64(1.0 / 120.0));
+        let mut bike = Bike::default();
+        bike.reset_at(-20.0, 8.0, 8.0);
+        bike.position.y += 10.0;
+        let mut app = App::new();
+        app.insert_resource(clock)
+            .insert_resource(bike)
+            .insert_resource(Controls {
+                pedal: 1.0,
+                ..default()
+            })
+            .init_resource::<RideStatus>()
+            .init_resource::<ChaseCamera>()
+            .init_resource::<scene::SkeletonDebug>()
+            .init_resource::<scene::AnimationState>()
+            .init_resource::<scene::BikeFrames>()
+            .init_resource::<crate::ragdoll::Ragdoll>()
+            .init_resource::<Showcase>()
+            .init_resource::<ski::Sport>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, read_controls)
+            .add_systems(FixedUpdate, (simulate, scene::record_frame).chain());
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app
+    }
+
+    /// Largest per-tick world movement of any drawn rider joint, m.
+    const MAX_JOINT_STEP: f32 = 0.04;
+
+    #[test]
+    fn a_crashed_rider_stands_up_where_it_fell_blends_smoothly_and_rides_on() {
+        use crate::ragdoll::{COUNT, Ragdoll, index};
+        let mut app = crashed_app();
+        let (mut crashed, mut recovered, mut rising) = (0, 0, 0);
+        let (mut hip, mut last, mut jump) = (Vec3::ZERO, None::<[Vec3; COUNT]>, 0.0_f32);
+        let mut standing = None;
+        for _ in 0..1800 {
+            app.world_mut().run_schedule(FixedUpdate);
+            let world = app.world();
+            let bike = world.resource::<Bike>();
+            if let Some(body) = &world.resource::<Ragdoll>().body {
+                hip = body.positions[index(scene::P::Hip)];
+            }
+            let joints = world.resource::<scene::BikeFrames>().joints().unwrap();
+            let rise = world.resource::<scene::AnimationState>().rise.is_some();
+            if bike.crash.is_some() {
+                crashed += 1;
+            } else if crashed > 0 {
+                recovered += 1;
+                if rise {
+                    rising += 1;
+                    let step = (0..COUNT).map(|i| joints[i].distance(last.unwrap()[i]));
+                    jump = jump.max(step.fold(0.0, f32::max));
+                } else if standing.is_none() {
+                    // The blend is over: the controls were ignored until now.
+                    assert!(bike.velocity.length() < 0.05, "{:?}", bike.velocity);
+                    standing = Some(recovered);
+                    assert!((bike.orientation() * Vec3::Y).y > 0.99);
+                    assert!(bike.position.xz().distance(Vec2::new(0.0, 8.0)) > 10.0);
+                    let rider = joints[index(scene::P::Hip)];
+                    assert!(Vec2::new(rider.x - hip.x, rider.z - hip.z).length() < 2.0);
+                }
+            }
+            last = Some(joints);
+            if standing.is_some_and(|s| recovered > s + 120) {
+                break;
+            }
+        }
+        let bike = app.world().resource::<Bike>();
+        assert!(
+            crashed > 0 && recovered > 0,
+            "never crashed or never recovered"
+        );
+        assert!(
+            (crashed as f32 / 120.0) <= crate::animation::GETUP_TIMEOUT + 0.05,
+            "lay {crashed} ticks"
+        );
+        assert!(
+            (rising as f32 / 120.0 - crate::animation::GETUP_BLEND).abs() < 0.05,
+            "{rising} blend ticks"
+        );
+        assert!(jump < MAX_JOINT_STEP, "joint moved {jump} m in one tick");
+        assert!(
+            bike.crash.is_none() && bike.velocity.length() > 1.0,
+            "{bike:?}"
+        );
+    }
+
+    #[test]
+    fn reset_during_the_blend_returns_to_the_start() {
+        use crate::ragdoll::Ragdoll;
+        let mut app = crashed_app();
+        while app
+            .world()
+            .resource::<scene::AnimationState>()
+            .rise
+            .is_none()
+        {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.world_mut().run_schedule(Update);
+        let world = app.world();
+        let bike = world.resource::<Bike>();
+        assert!(bike.crash.is_none() && bike.position.xz().distance(Vec2::new(0.0, 8.0)) < 0.5);
+        assert!(world.resource::<scene::AnimationState>().rise.is_none());
+        assert!(world.resource::<Ragdoll>().body.is_none());
     }
 
     #[test]

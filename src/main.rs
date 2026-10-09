@@ -1,4 +1,5 @@
 mod animation;
+mod audio;
 mod bike;
 mod game;
 mod ragdoll;

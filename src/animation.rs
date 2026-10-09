@@ -34,7 +34,35 @@ use crate::bike::{
     Bike, BikeTrick, Controls, HandTrick, LegTrick, SUSPENSION_REST, WHEEL_RADIUS, WHEELBASE,
     terrain_height,
 };
+use crate::ragdoll::COUNT;
 use crate::scene::smooth01;
+
+/// Seconds a crashed rider lies before standing up when the ragdoll has not come to rest.
+pub(crate) const GETUP_TIMEOUT: f32 = 3.0;
+/// Seconds the drawn rider takes to blend from the ragdoll pose to the riding pose.
+pub(crate) const GETUP_BLEND: f32 = 0.7;
+
+/// A rider standing up after a crash: the world-space ragdoll pose at recovery and the seconds since.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rise<T> {
+    pub from: T,
+    pub elapsed: f32,
+}
+
+impl<T> Rise<T> {
+    pub fn new(from: T) -> Self {
+        Self { from, elapsed: 0.0 }
+    }
+
+    /// Eased weight of the riding pose: 0 at recovery, 1 when the blend is over.
+    pub fn weight(&self) -> f32 {
+        smooth01(0.0, GETUP_BLEND, self.elapsed)
+    }
+
+    pub fn done(&self) -> bool {
+        self.elapsed >= GETUP_BLEND
+    }
+}
 
 const GRAVITY: f32 = 9.81;
 const MAX_DT: f32 = 1.0 / 15.0;
@@ -488,6 +516,8 @@ pub(crate) struct AnimationState {
     pub note: &'static str,
     /// Set by the game while paused, unfocused or crashed: nothing advances.
     pub frozen: bool,
+    /// Set while the rider blends from the ragdoll back to the riding pose; controls are ignored.
+    pub rise: Option<Rise<[Vec3; COUNT]>>,
     pub stand: f32,
     pub crouch: f32,
     pub back: f32,
@@ -559,6 +589,7 @@ impl Default for AnimationState {
             bike: BikeTrick::None,
             note: "",
             frozen: false,
+            rise: None,
             stand: 0.0,
             crouch: 0.0,
             back: 0.0,

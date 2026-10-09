@@ -1019,21 +1019,35 @@ fn lerp_transform(a: &Transform, b: &Transform, t: f32) -> Transform {
     }
 }
 
+/// Head orientation from the neck-head and shoulder lines of a ragdolled or rising rider.
+fn head_from_joints(rig: &Rig) -> Option<Quat> {
+    let up = (rig[P::Head] - rig[P::Neck]).normalize_or_zero();
+    let right = (rig[P::ShoulderR] - rig[P::ShoulderL]).normalize_or_zero();
+    let back = right.cross(up).normalize_or_zero();
+    let up = back.cross(right).normalize_or_zero();
+    (right.length_squared() > 0.9 && up.length_squared() > 0.9)
+        .then(|| Quat::from_mat3(&Mat3::from_cols(right, up, back)))
+}
+
 impl Frame {
     fn new(bike: &Bike, anim: &AnimationState, ragdoll: &Ragdoll) -> Self {
         let mut rig = rig(bike, anim);
         let root = bike.orientation();
+        let local = |world: Vec3| root.inverse() * (world - bike.position);
         if let Some(body) = &ragdoll.body {
             for i in 0..COUNT {
-                rig.p[P::Hip as usize + i] = root.inverse() * (body.positions[i] - bike.position);
+                rig.p[P::Hip as usize + i] = local(body.positions[i]);
             }
-            let up = (rig[P::Head] - rig[P::Neck]).normalize_or_zero();
-            let right = (rig[P::ShoulderR] - rig[P::ShoulderL]).normalize_or_zero();
-            let back = right.cross(up).normalize_or_zero();
-            let up = back.cross(right).normalize_or_zero();
-            if right.length_squared() > 0.9 && up.length_squared() > 0.9 {
-                rig.head_rot = Quat::from_mat3(&Mat3::from_cols(right, up, back));
+            rig.head_rot = head_from_joints(&rig).unwrap_or(rig.head_rot);
+        } else if let Some(rise) = &anim.rise {
+            // Standing up: from the world-space ragdoll pose to the riding pose.
+            let t = rise.weight();
+            for i in 0..COUNT {
+                let riding = rig.p[P::Hip as usize + i];
+                rig.p[P::Hip as usize + i] = local(rise.from[i]).lerp(riding, t);
             }
+            rig.head_rot =
+                head_from_joints(&rig).map_or(rig.head_rot, |q| q.slerp(rig.head_rot, t));
         }
         Self {
             rig,
@@ -1116,6 +1130,15 @@ impl BikeFrames {
     pub(crate) fn hip(&self, alpha: f32) -> Option<Vec3> {
         self.pair()
             .map(|(p, c)| p.world_hip().lerp(c.world_hip(), alpha))
+    }
+
+    /// World-space rider joints of the newest drawn frame.
+    #[cfg(test)]
+    pub(crate) fn joints(&self) -> Option<[Vec3; COUNT]> {
+        let f = self.current.as_ref()?;
+        Some(std::array::from_fn(|i| {
+            f.position + f.root * f.rig.p[P::Hip as usize + i]
+        }))
     }
 }
 

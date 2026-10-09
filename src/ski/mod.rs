@@ -4,12 +4,13 @@
 
 mod anim;
 mod demo;
-mod physics;
+pub(crate) mod physics;
 pub(crate) mod pose;
 mod ragdoll;
 mod render;
 mod rig;
 
+use crate::animation::{GETUP_TIMEOUT, Rise};
 use crate::game::{ChaseCamera, RideStatus};
 use anim::SkiAnimation;
 use bevy::ecs::system::SystemParam;
@@ -79,9 +80,34 @@ impl Plugin for SkiPlugin {
     }
 }
 
-/// The pose every consumer draws: the ragdoll once crashed, otherwise the animated rig.
+/// The pose every consumer draws: the ragdoll once crashed, otherwise the animated rig (blended
+/// from the ragdoll pose while standing back up).
 pub(crate) fn current_pose(s: &Skier, a: &SkiAnimation, r: &SkiRagdoll) -> SkierPose {
-    r.pose().unwrap_or_else(|| rig::solve(s, a))
+    r.pose().unwrap_or_else(|| {
+        let riding = rig::solve(s, a);
+        a.rise
+            .as_ref()
+            .map_or(riding, |up| lerp_pose(&up.from, &riding, up.weight()))
+    })
+}
+
+/// Stands a crashed skier up on the snow under the ragdoll pelvis, facing the crash heading, once
+/// the ragdoll sleeps or `GETUP_TIMEOUT` has passed. The drawn pose then blends from the ragdoll's.
+fn stand_up(skier: &mut Skier, anim: &mut SkiAnimation, ragdoll: &mut SkiRagdoll) -> bool {
+    let Some(crash) = skier.crash else {
+        return false;
+    };
+    if !(ragdoll.sleeping() || crash.elapsed >= GETUP_TIMEOUT) {
+        return false;
+    }
+    let (Some(pose), Some((pelvis, _))) = (ragdoll.pose(), ragdoll.centre()) else {
+        return false;
+    };
+    skier.reset_at(pelvis.x, pelvis.z, skier.heading, 0.0);
+    anim.reset();
+    anim.rise = Some(Rise::new(pose));
+    ragdoll.reset();
+    true
 }
 
 /// Per-tick drawn pose plus skier root, kept for the last two fixed ticks so display frames can
@@ -452,6 +478,13 @@ fn simulate_ski(
         frames.clear();
         reset_camera(&mut chase, true);
     }
+    if let Some(up) = &mut anim.rise {
+        up.elapsed += dt;
+        input = SkiControls::default();
+        if up.done() {
+            anim.rise = None;
+        }
+    }
     if skier.crash.is_none() {
         anim.update(&skier, &input, dt);
     }
@@ -463,9 +496,11 @@ fn simulate_ski(
             ragdoll.activate(&last.unwrap_or(pose), &pose, dt);
         }
         ragdoll.step(dt);
-        anim.mode = "crashed";
-        anim.phase = "ragdoll";
-        anim.frozen = true;
+        if demo.enabled || !stand_up(&mut skier, &mut anim, &mut ragdoll) {
+            anim.mode = "crashed";
+            anim.phase = "ragdoll";
+            anim.frozen = true;
+        }
     }
     *last = Some(pose);
     frames.push(current_pose(&skier, &anim, &ragdoll), skier.position);
@@ -535,6 +570,7 @@ fn show_panels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bike::{HILL_START_Z, HILL_X};
 
     #[test]
     fn trick_names_round_to_half_turns_and_whole_flips() {
@@ -570,5 +606,139 @@ mod tests {
         assert!((m.ski_up[0].length() - 1.0).abs() < 1e-5);
         assert!((m.facing.length() - 1.0).abs() < 1e-5);
         assert!((m.gaze.length() - 1.0).abs() < 1e-5);
+    }
+
+    /// The real ski systems, a skier dropped 2 m at 20 m/s onto flat snow at (-40, 0) (a hard-impact
+    /// crash far from the summit start), the push key held throughout. `Update` has run once, so
+    /// entering ski mode has already reset the skier.
+    fn crashed_app() -> App {
+        let mut clock = Time::<Fixed>::from_hz(120.0);
+        clock.advance_by(std::time::Duration::from_secs_f64(1.0 / 120.0));
+        let mut app = App::new();
+        app.insert_resource(clock)
+            .insert_resource(Sport::Ski)
+            .init_resource::<RideStatus>()
+            .init_resource::<ChaseCamera>()
+            .init_resource::<SkiFrames>()
+            .init_resource::<Skier>()
+            .init_resource::<SkiControls>()
+            .init_resource::<SkiAnimation>()
+            .init_resource::<SkiRagdoll>()
+            .init_resource::<SkiDemo>()
+            .init_resource::<SkiStatus>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, read_ski_controls)
+            .add_systems(FixedUpdate, simulate_ski);
+        app.world_mut().run_schedule(Update);
+        let mut skier = app.world_mut().resource_mut::<Skier>();
+        skier.reset_at(-40.0, 0.0, 0.0, 8.0);
+        skier.grounded = false;
+        skier.position.y = 2.0;
+        skier.velocity.y = -20.0;
+        app.world_mut().resource_mut::<SkiControls>().push = 1.0;
+        app
+    }
+
+    /// Largest per-tick world movement of a drawn body joint (pelvis to hands), m.
+    const MAX_JOINT_STEP: f32 = 0.04;
+    /// Same for skis and poles, which the crash may have thrown far away and which fly back to the
+    /// rider over the blend (24 m in this test), m.
+    const MAX_GEAR_STEP: f32 = 0.5;
+
+    #[test]
+    fn a_crashed_skier_stands_up_where_it_fell_blends_smoothly_and_skis_on() {
+        let mut app = crashed_app();
+        let (mut crashed, mut recovered, mut rising) = (0, 0, 0);
+        let (mut pelvis, mut last) = (Vec3::ZERO, None::<SkierPose>);
+        let (mut jump, mut gear_jump) = (0.0_f32, 0.0_f32);
+        let mut standing = None;
+        for _ in 0..2400 {
+            app.world_mut().run_schedule(FixedUpdate);
+            let world = app.world();
+            let skier = world.resource::<Skier>();
+            if let Some((p, _)) = world.resource::<SkiRagdoll>().centre() {
+                pelvis = p;
+            }
+            let pose = world.resource::<SkiFrames>().current.unwrap().pose;
+            let rise = world.resource::<SkiAnimation>().rise.is_some();
+            if skier.crash.is_some() {
+                crashed += 1;
+            } else if crashed > 0 {
+                recovered += 1;
+                if rise {
+                    rising += 1;
+                    let before = last.unwrap();
+                    let step = |range: std::ops::Range<usize>| {
+                        range
+                            .map(|i| pose.p[i].distance(before.p[i]))
+                            .fold(0.0, f32::max)
+                    };
+                    let body = pose::J::BindL as usize;
+                    jump = jump.max(step(0..body));
+                    gear_jump = gear_jump.max(step(body..pose::JOINTS));
+                } else if standing.is_none() {
+                    // The blend is over: the controls were ignored until now.
+                    assert!(skier.speed() < 0.05, "{:?}", skier.velocity);
+                    standing = Some(recovered);
+                    assert!(skier.up().y > 0.99);
+                    assert!(
+                        skier
+                            .position
+                            .xz()
+                            .distance(Vec2::new(HILL_X, HILL_START_Z))
+                            > 10.0
+                    );
+                    let rider = pose[pose::J::Pelvis];
+                    assert!(Vec2::new(rider.x - pelvis.x, rider.z - pelvis.z).length() < 2.0);
+                }
+            }
+            last = Some(pose);
+            if standing.is_some_and(|s| recovered > s + 120) {
+                break;
+            }
+        }
+        let skier = app.world().resource::<Skier>();
+        assert!(
+            crashed > 0 && recovered > 0,
+            "never crashed or never recovered"
+        );
+        assert!(
+            (crashed as f32 / 120.0) <= GETUP_TIMEOUT + 0.05,
+            "lay {crashed} ticks"
+        );
+        assert!(
+            (rising as f32 / 120.0 - crate::animation::GETUP_BLEND).abs() < 0.05,
+            "{rising} blend ticks"
+        );
+        assert!(jump < MAX_JOINT_STEP, "joint moved {jump} m in one tick");
+        assert!(
+            gear_jump < MAX_GEAR_STEP,
+            "gear moved {gear_jump} m in one tick"
+        );
+        assert!(skier.crash.is_none() && skier.speed() > 0.5, "{skier:?}");
+    }
+
+    #[test]
+    fn reset_during_the_blend_returns_to_the_summit() {
+        let mut app = crashed_app();
+        while app.world().resource::<SkiAnimation>().rise.is_none() {
+            app.world_mut().run_schedule(FixedUpdate);
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.world_mut().run_schedule(Update);
+        let world = app.world();
+        let skier = world.resource::<Skier>();
+        assert!(skier.crash.is_none());
+        assert!(
+            skier
+                .position
+                .xz()
+                .distance(Vec2::new(HILL_X, HILL_START_Z))
+                < 0.5
+        );
+        assert!(world.resource::<SkiAnimation>().rise.is_none());
+        assert!(!world.resource::<SkiRagdoll>().active());
     }
 }

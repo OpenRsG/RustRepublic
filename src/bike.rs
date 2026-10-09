@@ -629,19 +629,22 @@ fn sane(x: f32, lo: f32, hi: f32) -> f32 {
 
 impl Default for Bike {
     fn default() -> Self {
-        Self::placed(Discipline::default(), 0.0, 8.0, 0.0)
+        Self::placed(Discipline::default(), 0.0, 8.0, 0.0, 0.0)
     }
 }
 
 impl Bike {
-    /// Rolling at `speed` along the slope at (x, z), facing -Z, settled on the struts of
-    /// `discipline`.
-    fn placed(discipline: Discipline, x: f32, z: f32, speed: f32) -> Self {
+    /// Rolling at `speed` along the slope at (x, z), nose towards heading `yaw`, settled on the
+    /// struts of `discipline`.
+    fn placed(discipline: Discipline, x: f32, z: f32, yaw: f32, speed: f32) -> Self {
         let sag = GRAVITY / (2.0 * discipline.profile().spring);
         let pose = CollisionPose::default();
+        let turn = Quat::from_rotation_y(yaw);
         let (mut pitch, mut y) = (0.0_f32, 0.0_f32);
         for _ in 0..4 {
-            let arms = pose.wheel_rest.map(|r| Quat::from_rotation_x(pitch) * r);
+            let arms = pose
+                .wheel_rest
+                .map(|r| turn * Quat::from_rotation_x(pitch) * r);
             let ground = arms.map(|a| {
                 let s = terrain_slope(x + a.x, z + a.z);
                 terrain_height(x + a.x, z + a.z) + WHEEL_RADIUS * (1.0 + s.length_squared()).sqrt()
@@ -651,11 +654,11 @@ impl Bike {
                 .clamp(-1.0, 1.0)
                 .asin();
         }
-        let rot = Quat::from_rotation_x(pitch);
+        let rot = turn * Quat::from_rotation_x(pitch);
         let mut bike = Self {
             position: Vec3::new(x, y, z),
             velocity: rot * Vec3::NEG_Z * speed,
-            yaw: 0.0,
+            yaw,
             pitch,
             roll: 0.0,
             steering: 0.0,
@@ -681,15 +684,15 @@ impl Bike {
     }
 
     /// Fresh bike of `discipline` at (x, z), keeping the current collision pose.
-    fn restart(&mut self, discipline: Discipline, x: f32, z: f32, speed: f32) {
+    fn restart(&mut self, discipline: Discipline, x: f32, z: f32, yaw: f32, speed: f32) {
         let pose = self.collision_pose;
-        *self = Self::placed(discipline, x, z, speed);
+        *self = Self::placed(discipline, x, z, yaw, speed);
         self.collision_pose = pose;
     }
 
     /// Switches profile and resets the bike to the settled start pose.
     pub fn select_discipline(&mut self, discipline: Discipline) {
-        self.restart(discipline, 0.0, 8.0, 0.0);
+        self.restart(discipline, 0.0, 8.0, 0.0, 0.0);
     }
 
     /// Resets to the start pose, keeping the selected discipline.
@@ -700,7 +703,12 @@ impl Bike {
     /// Restarts rolling at `speed` m/s down the local slope at (x, z), facing -Z, settled on the
     /// struts (no airborne drop); clears any crash. Keeps the discipline.
     pub fn reset_at(&mut self, x: f32, z: f32, speed: f32) {
-        self.restart(self.discipline, x, z, speed);
+        self.restart(self.discipline, x, z, 0.0, speed);
+    }
+
+    /// Stands the bike up at rest at (x, z) with its nose towards heading `yaw`; clears any crash.
+    pub fn reset_facing(&mut self, x: f32, z: f32, yaw: f32) {
+        self.restart(self.discipline, x, z, yaw, 0.0);
     }
 
     pub fn orientation(&self) -> Quat {

@@ -445,8 +445,7 @@ impl Skier {
     }
 
     /// Places the skier on the snow at `(x, z)` facing `yaw`, moving `speed` m/s along the skis.
-    /// Clears any crash. Test setup only; the game starts runs from the summit.
-    #[cfg(test)]
+    /// Clears any crash; the game starts runs from the summit and stands crashed skiers up here.
     pub fn reset_at(&mut self, x: f32, z: f32, yaw: f32, speed: f32) {
         *self = Self::placed(x, z, yaw, speed);
     }

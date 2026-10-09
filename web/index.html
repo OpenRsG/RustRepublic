@@ -1,91 +1,313 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>RiderRepRust</title>
   <style>
-    html, body { margin: 0; height: 100%; background: #ececee; overflow: hidden; }
-    canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
-    #status { position: absolute; inset: 0; display: grid; place-items: center;
-      font: 16px system-ui, sans-serif; color: #234; text-align: center; padding: 24px; }
-    #status .card { width: min(340px, 80vw); display: grid; gap: 10px; }
-    #status b { font-size: 20px; }
-    #status .bar { height: 8px; border-radius: 4px; background: #d5d9e0; overflow: hidden; }
-    #fill { display: block; height: 100%; width: 0; background: #e87434; transition: width .2s; }
-    #status.busy #fill { animation: pulse .8s ease-in-out infinite alternate; }
-    @keyframes pulse { to { opacity: .45; } }
-    #detail { font: 12px ui-monospace, monospace; opacity: .65; min-height: 1.2em; }
-    :root { --s: min(60px, 13vmin); --stick: min(150px, 34vmin); --pad: max(16px, env(safe-area-inset-left));
-      --bottom: max(16px, env(safe-area-inset-bottom)); }
-    /* Overlay: only the controls themselves take input; the rest of the screen still orbits the camera. */
-    #ui { position: absolute; inset: 0; pointer-events: none; font: 600 13px system-ui, sans-serif;
-      color: #fff; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-    #ui > * { pointer-events: auto; touch-action: none; }
-    .round { position: absolute; display: grid; place-items: center; width: var(--s); height: var(--s);
-      border-radius: 50%; background: rgba(24, 34, 48, .38); border: 2px solid rgba(255, 255, 255, .55);
-      box-sizing: border-box; text-align: center; line-height: 1.05; font-size: 11px; letter-spacing: .02em; }
-    .round.on, .round.hit { background: rgba(232, 116, 52, .8); }
-    #top { top: max(12px, env(safe-area-inset-top)); right: var(--pad); display: flex; gap: 10px; position: absolute; }
-    #top .round { position: static; width: 44px; height: 44px; font-size: 20px; }
-    @media (orientation: portrait) { #top { flex-direction: column-reverse; } }
-    .stick { position: absolute; bottom: var(--bottom); width: var(--stick); height: var(--stick); border-radius: 50%;
-      background: rgba(24, 34, 48, .22); border: 2px solid rgba(255, 255, 255, .5); box-sizing: border-box; }
-    .stick::after { content: attr(data-label); position: absolute; left: 0; right: 0; top: 9%;
-      text-align: center; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; opacity: .85; }
-    .knob { position: absolute; left: 30%; top: 30%; width: 40%; height: 40%; border-radius: 50%;
-      background: rgba(255, 255, 255, .75); box-shadow: 0 2px 6px rgba(0, 0, 0, .25); }
-    #ride { left: var(--pad); }
-    #air { right: var(--pad); }
-    /* Buttons sit between the air stick and the screen centre; bike-only moves take the top row. */
-    #pad { position: absolute; right: calc(var(--pad) + var(--stick) + 14px); bottom: var(--bottom);
-      display: grid; grid-template-columns: repeat(3, var(--s)); gap: 10px; }
-    #pad .round { position: static; }
-    #pad .jump { background: rgba(232, 116, 52, .55); }
-    @media (orientation: portrait) {
-      #pad { right: var(--pad); bottom: calc(var(--bottom) + var(--stick) + 30px); }
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #ececee;
+      overflow: hidden;
     }
-    #ui:not(.touch) .stick, #ui:not(.touch) #pad, #ui:not(.touch) .touchonly,
-    #ui.ski .bikeonly, #ui.bike .skionly { display: none; }
-    #menu { position: absolute; top: max(66px, calc(env(safe-area-inset-top) + 66px)); right: var(--pad);
-      max-height: calc(100% - 80px); overflow-y: auto; width: min(720px, calc(100% - 2 * var(--pad)));
-      padding: 12px; box-sizing: border-box; display: grid; gap: 10px 14px; align-content: start;
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      outline: none;
+      touch-action: none;
+    }
+
+    #status {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      font: 16px system-ui, sans-serif;
+      color: #234;
+      text-align: center;
+      padding: 24px;
+    }
+
+    #status .card {
+      width: min(340px, 80vw);
+      display: grid;
+      gap: 10px;
+    }
+
+    #status b {
+      font-size: 20px;
+    }
+
+    #status .bar {
+      height: 8px;
+      border-radius: 4px;
+      background: #d5d9e0;
+      overflow: hidden;
+    }
+
+    #fill {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: #e87434;
+      transition: width .2s;
+    }
+
+    #status.busy #fill {
+      animation: pulse .8s ease-in-out infinite alternate;
+    }
+
+    @keyframes pulse {
+      to {
+        opacity: .45;
+      }
+    }
+
+    #detail {
+      font: 12px ui-monospace, monospace;
+      opacity: .65;
+      min-height: 1.2em;
+    }
+
+    :root {
+      --s: min(60px, 13vmin);
+      --stick: min(150px, 34vmin);
+      --pad: max(16px, env(safe-area-inset-left));
+      --bottom: max(16px, env(safe-area-inset-bottom));
+    }
+
+    /* Overlay: only the controls themselves take input; the rest of the screen still orbits the camera. */
+    #ui {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      font: 600 13px system-ui, sans-serif;
+      color: #fff;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+
+    #ui>* {
+      pointer-events: auto;
+      touch-action: none;
+    }
+
+    .round {
+      position: absolute;
+      display: grid;
+      place-items: center;
+      width: var(--s);
+      height: var(--s);
+      border-radius: 50%;
+      background: rgba(24, 34, 48, .38);
+      border: 2px solid rgba(255, 255, 255, .55);
+      box-sizing: border-box;
+      text-align: center;
+      line-height: 1.05;
+      font-size: 11px;
+      letter-spacing: .02em;
+    }
+
+    .round.on,
+    .round.hit {
+      background: rgba(232, 116, 52, .8);
+    }
+
+    #top {
+      top: max(12px, env(safe-area-inset-top));
+      right: var(--pad);
+      display: flex;
+      gap: 10px;
+      position: absolute;
+    }
+
+    #top .round {
+      position: static;
+      width: 44px;
+      height: 44px;
+      font-size: 20px;
+    }
+
+    @media (orientation: portrait) {
+      #top {
+        flex-direction: column-reverse;
+      }
+    }
+
+    .stick {
+      position: absolute;
+      bottom: var(--bottom);
+      width: var(--stick);
+      height: var(--stick);
+      border-radius: 50%;
+      background: rgba(24, 34, 48, .22);
+      border: 2px solid rgba(255, 255, 255, .5);
+      box-sizing: border-box;
+    }
+
+    .stick::after {
+      content: attr(data-label);
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 9%;
+      text-align: center;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      opacity: .85;
+    }
+
+    .knob {
+      position: absolute;
+      left: 30%;
+      top: 30%;
+      width: 40%;
+      height: 40%;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, .75);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, .25);
+    }
+
+    #ride {
+      left: var(--pad);
+    }
+
+    #air {
+      right: var(--pad);
+    }
+
+    /* Buttons sit between the air stick and the screen centre; bike-only moves take the top row. */
+    #pad {
+      position: absolute;
+      right: calc(var(--pad) + var(--stick) + 14px);
+      bottom: var(--bottom);
+      display: grid;
+      grid-template-columns: repeat(3, var(--s));
+      gap: 10px;
+    }
+
+    #pad .round {
+      position: static;
+    }
+
+    #pad .jump {
+      background: rgba(232, 116, 52, .55);
+    }
+
+    @media (orientation: portrait) {
+      #pad {
+        right: var(--pad);
+        bottom: calc(var(--bottom) + var(--stick) + 30px);
+      }
+    }
+
+    #ui:not(.touch) .stick,
+    #ui:not(.touch) #pad,
+    #ui:not(.touch) .touchonly,
+    #ui.ski .bikeonly,
+    #ui.bike .skionly {
+      display: none;
+    }
+
+    #menu {
+      position: absolute;
+      top: max(66px, calc(env(safe-area-inset-top) + 66px));
+      right: var(--pad);
+      max-height: calc(100% - 80px);
+      overflow-y: auto;
+      width: min(720px, calc(100% - 2 * var(--pad)));
+      padding: 12px;
+      box-sizing: border-box;
+      display: grid;
+      gap: 10px 14px;
+      align-content: start;
       grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-      font: 600 13px system-ui, sans-serif; user-select: none; -webkit-user-select: none; touch-action: pan-y;
-      background: rgba(250, 250, 252, .94); color: #234; border-radius: 10px;
-      box-shadow: 0 6px 24px rgba(0, 0, 0, .18); }
-    #menu[hidden] { display: none; }
-    #menu h3 { margin: 0 2px 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; opacity: .6; }
-    #menu .row { display: flex; flex-wrap: wrap; gap: 6px; }
-    #menu .item { flex: 1 1 auto; padding: 8px 10px; border-radius: 7px; background: #e3e6eb; text-align: center;
-      white-space: nowrap; }
-    #menu .item.on { background: #e87434; color: #fff; }
-    #menu .item:active { background: #c9ced6; }
+      font: 600 13px system-ui, sans-serif;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: pan-y;
+      background: rgba(250, 250, 252, .94);
+      color: #234;
+      border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, .18);
+    }
+
+    #menu[hidden] {
+      display: none;
+    }
+
+    #menu h3 {
+      margin: 0 2px 6px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      opacity: .6;
+    }
+
+    #menu .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    #menu .item {
+      flex: 1 1 auto;
+      padding: 8px 10px;
+      border-radius: 7px;
+      background: #e3e6eb;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    #menu .item.on {
+      background: #e87434;
+      color: #fff;
+    }
+
+    #menu .item:active {
+      background: #c9ced6;
+    }
   </style>
 </head>
+
 <body>
   <canvas id="bevy" tabindex="0"></canvas>
-  <div id="status"><div class="card">
-    <b>RiderRepRust</b>
-    <div id="stage">Loading page</div>
-    <div class="bar"><i id="fill"></i></div>
-    <div id="detail"></div>
-  </div></div>
+  <div id="status">
+    <div class="card">
+      <b>RiderRepRust</b>
+      <div id="stage">Loading page</div>
+      <div class="bar"><i id="fill"></i></div>
+      <div id="detail"></div>
+    </div>
+  </div>
   <div id="ui" class="ski">
     <div id="top">
       <div class="round touchonly" data-tap="KeyR" title="Reset">↺</div>
       <div class="round touchonly" data-tap="KeyC" title="Recenter camera">◎</div>
       <div class="round" id="open" title="Menu">☰</div>
     </div>
-    <div class="stick" id="ride" data-label="ride"><div class="knob"></div></div>
-    <div class="stick" id="air" data-label="lean / flip"><div class="knob"></div></div>
+    <div class="stick" id="ride" data-label="ride">
+      <div class="knob"></div>
+    </div>
+    <div class="stick" id="air" data-label="lean / flip">
+      <div class="knob"></div>
+    </div>
     <div id="pad">
       <div class="round bikeonly" data-hold="KeyQ">WHEELIE</div>
       <div class="round bikeonly" data-hold="KeyZ">MANUAL</div>
       <div class="round bikeonly" data-hold="KeyX">NOSE<br>MANUAL</div>
       <div class="round" data-hold="ControlLeft">FLIP</div>
       <div class="round" data-hold="KeyB">TRICK<br>GRAB</div>
-      <div class="round" data-hold="ShiftLeft"><span class="bikeonly">SPRINT</span><span class="skionly">TUCK</span></div>
+      <div class="round" data-hold="ShiftLeft"><span class="bikeonly">SPRINT</span><span class="skionly">TUCK</span>
+      </div>
       <div class="round" data-hold="KeyT">SPIN<br>⟲</div>
       <div class="round jump" data-hold="Space"><span class="bikeonly">HOP</span><span class="skionly">JUMP</span></div>
       <div class="round" data-hold="KeyE">SPIN<br>⟳</div>
@@ -126,6 +348,7 @@
         <div class="item" data-tap="KeyR">Reset</div>
         <div class="item" data-tap="Escape">Pause</div>
         <div class="item" data-tap="KeyC">Camera</div>
+        <div class="item" data-tap="KeyM">Sound</div>
       </div>
     </section>
     <section>
@@ -148,14 +371,14 @@
     // The game reads the keyboard, so every on-screen control is a synthetic key on the canvas.
     const keyName = (code) => code.startsWith('Key') ? code.slice(3).toLowerCase()
       : code.startsWith('Digit') ? code.slice(5)
-      : { Space: ' ', ShiftLeft: 'Shift', ControlLeft: 'Control' }[code] ?? code;
+        : {Space: ' ', ShiftLeft: 'Shift', ControlLeft: 'Control'}[code] ?? code;
     const send = (type, code) => canvas.dispatchEvent(new KeyboardEvent(type,
-      { code, key: keyName(code), location: /Left$/.test(code) ? 1 : 0, bubbles: true, cancelable: true }));
+      {code, key: keyName(code), location: /Left$/.test(code) ? 1 : 0, bubbles: true, cancelable: true}));
     const after = (ms) => new Promise((done) => setTimeout(done, ms));
     // The game polls input once per animation frame: space presses by frames, not milliseconds,
     // so each is seen on its own frame even on a slow phone.
-    const frames = async (n) => { while (n--) await new Promise(requestAnimationFrame); };
-    const tap = async (code) => { send('keydown', code); await frames(3); send('keyup', code); await frames(3); };
+    const frames = async (n) => {while (n--) await new Promise(requestAnimationFrame);};
+    const tap = async (code) => {send('keydown', code); await frames(3); send('keyup', code); await frames(3);};
 
     // Mirror the game's mode switches (from taps and real keys) to label the menu and buttons.
     let sport = 'ski', discipline = null, demo = true;
@@ -173,13 +396,13 @@
     };
     window.addEventListener('keydown', (e) => {
       if (e.repeat) return;
-      if (/^Digit[1-4]$/.test(e.code)) { sport = 'bike'; discipline = e.code; demo = false; }
-      else if (e.code === 'Digit5' && sport !== 'ski') { sport = 'ski'; demo = false; }
-      else if (e.code === 'F6') { demo = !demo; if (demo && sport === 'bike') discipline = 'Digit4'; }
+      if (/^Digit[1-4]$/.test(e.code)) {sport = 'bike'; discipline = e.code; demo = false;}
+      else if (e.code === 'Digit5' && sport !== 'ski') {sport = 'ski'; demo = false;}
+      else if (e.code === 'F6') {demo = !demo; if (demo && sport === 'bike') discipline = 'Digit4';}
       refresh();
     });
     // Playing takes over from the showcase.
-    const takeOver = () => { if (demo) send('keydown', 'F6'), send('keyup', 'F6'); };
+    const takeOver = () => {if (demo) send('keydown', 'F6'), send('keyup', 'F6');};
 
     // Pointer down must not move focus off the canvas: the game drops held keys on blur.
     const own = (el) => el.addEventListener('pointerdown', (e) => e.preventDefault());
@@ -200,8 +423,8 @@
       grab(el);
       const code = el.dataset.hold;
       let held = false;
-      el.addEventListener('pointerdown', () => { takeOver(); held = true; el.classList.add('on'); send('keydown', code); });
-      const release = () => { if (held) { held = false; el.classList.remove('on'); send('keyup', code); } };
+      el.addEventListener('pointerdown', () => {takeOver(); held = true; el.classList.add('on'); send('keydown', code);});
+      const release = () => {if (held) {held = false; el.classList.remove('on'); send('keyup', code);} };
       el.addEventListener('pointerup', release);
       el.addEventListener('pointercancel', release);
       el.addEventListener('lostpointercapture', release);
@@ -213,14 +436,14 @@
       let id = null;
       const held = new Set();
       const want = (next) => {
-        for (const k of held) if (!next.has(k)) { held.delete(k); send('keyup', k); }
-        for (const k of next) if (!held.has(k)) { held.add(k); send('keydown', k); }
+        for (const k of held) if (!next.has(k)) {held.delete(k); send('keyup', k);}
+        for (const k of next) if (!held.has(k)) {held.add(k); send('keydown', k);}
       };
       const move = (e) => {
         const r = el.getBoundingClientRect(), half = r.width / 2;
         let x = (e.clientX - r.left - half) / half, y = (e.clientY - r.top - half) / half;
         const m = Math.hypot(x, y);
-        if (m > 1) { x /= m; y /= m; }
+        if (m > 1) {x /= m; y /= m;}
         knob.style.transform = `translate(${x * half * 0.7}px, ${y * half * 0.7}px)`;
         const next = new Set();
         // sin(22.5°): diagonals cover the 45° between the axes.
@@ -233,9 +456,9 @@
         want(next);
       };
       grab(el);
-      el.addEventListener('pointerdown', (e) => { if (id === null) { takeOver(); id = e.pointerId; move(e); } });
-      el.addEventListener('pointermove', (e) => { if (e.pointerId === id) move(e); });
-      const end = (e) => { if (e.pointerId === id) { id = null; knob.style.transform = ''; want(new Set()); } };
+      el.addEventListener('pointerdown', (e) => {if (id === null) {takeOver(); id = e.pointerId; move(e);} });
+      el.addEventListener('pointermove', (e) => {if (e.pointerId === id) move(e);});
+      const end = (e) => {if (e.pointerId === id) {id = null; knob.style.transform = ''; want(new Set());} };
       el.addEventListener('pointerup', end);
       el.addEventListener('pointercancel', end);
       el.addEventListener('lostpointercapture', end);
@@ -245,12 +468,12 @@
 
     const open = document.getElementById('open');
     own(open);
-    open.addEventListener('click', () => { menu.hidden = !menu.hidden; open.classList.toggle('on', !menu.hidden); });
+    open.addEventListener('click', () => {menu.hidden = !menu.hidden; open.classList.toggle('on', !menu.hidden);});
     own(menu);
-    document.getElementById('touch').addEventListener('click', () => { ui.classList.toggle('touch'); refresh(); });
+    document.getElementById('touch').addEventListener('click', () => {ui.classList.toggle('touch'); refresh();});
     document.getElementById('full').addEventListener('click', () => {
       if (document.fullscreenElement) document.exitFullscreen();
-      else document.documentElement.requestFullscreen?.().catch(() => {});
+      else document.documentElement.requestFullscreen?.().catch(() => { });
     });
     document.getElementById('ski-demo').addEventListener('click', async () => {
       if (sport !== 'ski') await tap('Digit5');
@@ -268,10 +491,10 @@
     // Browsers start an AudioContext made before any click suspended; resume the game's on the first gesture.
     const contexts = [];
     window.AudioContext = class extends window.AudioContext {
-      constructor(...args) { super(...args); contexts.push(this); }
+      constructor(...args) {super(...args); contexts.push(this);}
     };
     const wake = () => contexts.forEach((c) => c.state === 'suspended' && c.resume());
-    for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, wake, { capture: true });
+    for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, wake, {capture: true});
 
     // Loading screen: script, wasm download (counted as it streams into the compiler), compile, GPU start.
     const [stage, fill, detail] = ['stage', 'fill', 'detail'].map((id) => document.getElementById(id));
@@ -303,11 +526,11 @@
           else show('Downloading game', .5, `${mb(got)} MB`);
           out.enqueue(chunk);
         },
-        flush() { show('Compiling WebAssembly', .9, `${mb(got)} MB`); },
+        flush() {show('Compiling WebAssembly', .9, `${mb(got)} MB`);},
       }));
       // A server that already decoded the .gz (Content-Encoding: gzip) hands over the wasm itself.
       const body = gz && !/gzip/.test(encoding ?? '') ? counted.pipeThrough(new DecompressionStream('gzip')) : counted;
-      await game.default({ module_or_path: new Response(body, { headers: { 'Content-Type': 'application/wasm' } }) });
+      await game.default({module_or_path: new Response(body, {headers: {'Content-Type': 'application/wasm'}})});
       show('Starting WebGPU and building the world', .96);
     }
 
@@ -329,9 +552,10 @@
         seen.disconnect();
         status.remove();
         // The on-screen sticks sit where the key help panel is; portrait already hides it.
-        if (touch && innerWidth > innerHeight) { await after(500); tap('KeyH'); }
-      }).observe(canvas, { attributes: true });
+        if (touch && innerWidth > innerHeight) {await after(500); tap('KeyH');}
+      }).observe(canvas, {attributes: true});
     }
   </script>
 </body>
+
 </html>

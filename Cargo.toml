@@ -22,7 +22,7 @@ path = "src/bin/assets.rs"
 
 [dependencies]
 bevy = { version = "=0.17.3", optional = true, default-features = false, features = [
-    "std", "async_executor", "multi_threaded", "bevy_asset", "bevy_color",
+    "std", "async_executor", "multi_threaded", "bevy_asset", "bevy_audio", "bevy_color",
     "bevy_core_pipeline", "bevy_pbr", "bevy_render", "bevy_image", "bevy_mesh",
     "bevy_camera", "bevy_light", "bevy_shader", "bevy_text", "bevy_ui",
     "bevy_ui_render", "bevy_window", "bevy_winit", "bevy_log", "default_font",

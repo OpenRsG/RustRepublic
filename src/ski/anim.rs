@@ -2,7 +2,8 @@
 //! `rig::solve` turns these weights plus the `Skier` into a world-space `SkierPose`.
 
 use super::physics::{Grab, SkiControls, Skier};
-use crate::animation::jitter;
+use super::pose::SkierPose;
+use crate::animation::{Rise, jitter};
 use crate::bike::terrain_height;
 use bevy::prelude::*;
 
@@ -147,6 +148,8 @@ pub struct SkiAnimation {
     pub note: &'static str,
     /// Set by the integrator when paused / crashed; `update` does not advance.
     pub frozen: bool,
+    /// Set while the skier blends from the ragdoll back to the riding pose; controls are ignored.
+    pub rise: Option<Rise<SkierPose>>,
     pub(super) w: Blend,
 }
 
@@ -158,6 +161,7 @@ impl Default for SkiAnimation {
             grab: Grab::None,
             note: "relaxed stance, poles trailing",
             frozen: false,
+            rise: None,
             w: Blend {
                 was_grounded: true,
                 switch_side: 1.0,
