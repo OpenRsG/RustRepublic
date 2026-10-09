@@ -10,13 +10,14 @@
 //! Model: the chassis is a point mass with an arcade rotational inertia, carried by two massless
 //! wheels on spring/damper struts pushing along the terrain normal. Everything is per unit mass.
 //! Every ground force (strut, drive, brake) acts at the tyre patch, so its pitch torque is the real
-//! root-to-patch lever crossed with the force; drive and brake forces are capped by the wheel's
-//! strut load (`GROUND_MU`), so a wheel that unloads under braking fades out continuously rather
-//! than switching on a contact flag. Steering and lean are arcade-assisted. A landing is judged on
-//! touchdown against the surface (attitude, slip, spin, closing speed, grip support); a failed
-//! landing, or any rider/frame proxy striking the floor while riding, is a crash: the bike alone
-//! (wheels and frame proxies) then tumbles under gravity and friction until reset, while the
-//! detached rider is simulated separately (`ragdoll`).
+//! root-to-patch lever crossed with the force; drive, brake and cornering forces share one grip
+//! budget per wheel, its strut load times `GROUND_MU`, so a wheel that unloads under braking fades
+//! out continuously rather than switching on a contact flag. At speed the rider leans the bike
+//! and the lean turns it (countersteer first); the front wheel angle is read back from the turn.
+//! A landing is judged on touchdown against the surface (attitude, slip, spin, closing speed, grip
+//! support); a failed landing, or any rider/frame proxy striking the floor while riding, is a
+//! crash: the bike alone (wheels and frame proxies) then tumbles under gravity and friction until
+//! reset, while the detached rider is simulated separately (`ragdoll`).
 
 use bevy::prelude::{Quat, Resource, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -40,9 +41,10 @@ const STOP_START: f32 = 0.14;
 const STOP_K: f32 = 600.0;
 const MAX_WHEEL_FORCE: f32 = 60.0;
 const GYRATION_SQ: f32 = 0.2;
-// Tyre friction coefficient: the longitudinal (drive/brake) force a wheel can transmit is at most
-// this times its strut load, so a wheel that unloads fades out smoothly instead of switching.
-const GROUND_MU: f32 = 1.2;
+// Tyre friction coefficient: the force a wheel can transmit, longitudinal (drive/brake) and lateral
+// (cornering, slip removal) together, is at most this times its strut load, so a wheel that unloads
+// fades out smoothly instead of switching.
+const GROUND_MU: f32 = 0.65;
 const SLOPE_EPS: f32 = 0.05;
 
 // Drive. Pedal force is capped at low speed (scaled by profile power / Downhill power) and
@@ -56,13 +58,25 @@ const BRAKE_FRONT: f32 = 0.65;
 const BRAKE_REAR: f32 = 0.35;
 const TIRE_GRIP: f32 = 20.0;
 
-// Steering and lean.
+// Steering and lean. At walking pace the front wheel angle turns the bike; from the first to the
+// second speed (m/s) the turn is led by the lean instead.
 const STEER_RESPONSE: f32 = 12.0;
 const STEER_SPEED_REF: f32 = 5.0;
-const MAX_LATERAL_ACCEL: f32 = 7.0;
+const LEAN_STEER_SPEED: (f32, f32) = (3.0, 6.0);
 const MAX_LEAN: f32 = 0.5;
-const LEAN_GAIN: f32 = 0.9;
-const LEAN_RESPONSE: f32 = 8.0;
+/// Roll rate (1/s per rad of lean error) the rider rolls with, the most it can reach, rad/s, and
+/// how fast the roll rate catches up with it (1/s).
+const ROLL_RESPONSE: f32 = 8.0;
+const MAX_ROLL_RATE: f32 = 3.0;
+const ROLL_ACCEL_RESPONSE: f32 = 15.0;
+/// Yaw rate pushed against the roll rate by the rider's countersteer, rad/s per rad/s.
+const COUNTERSTEER: f32 = 0.25;
+// Front washout: the front tyre over its grip budget while sliding sideways faster than
+// `WASH_SLIP` (m/s). Fully sliding is `WASH_OVERLOAD` over the budget; `WASH_TIME` seconds of it
+// drop the rider.
+const WASH_SLIP: f32 = 0.5;
+const WASH_OVERLOAD: f32 = 0.3;
+const WASH_TIME: f32 = 0.5;
 
 // Tricks.
 const HOP_PITCH_KICK: f32 = 1.5;
@@ -337,6 +351,7 @@ pub enum CrashReason {
     HardImpact,
     LoopedOut,
     OverTheBars,
+    Washout,
 }
 
 impl CrashReason {
@@ -349,6 +364,7 @@ impl CrashReason {
             Self::HardImpact => "Hard impact",
             Self::LoopedOut => "Looped out",
             Self::OverTheBars => "Over the bars",
+            Self::Washout => "Washout",
         }
     }
 }
@@ -544,6 +560,8 @@ pub struct Bike {
     pub crash: Option<Crash>,
     rot: Quat,
     wheel_omega: f32,
+    /// Seconds of front-tyre sliding accumulated towards a washout.
+    front_slide: f32,
     hop_latch: bool,
 }
 
@@ -655,6 +673,7 @@ impl Bike {
             crash: None,
             rot,
             wheel_omega: speed / WHEEL_RADIUS,
+            front_slide: 0.0,
             hop_latch: false,
         };
         bike.sync_attitude();
@@ -1032,17 +1051,20 @@ impl Bike {
         let mut v_f = v_h.dot(heading);
         let mut v_l = v_h.dot(right);
 
-        let steer_target = -c.steering * MAX_STEER_ANGLE / (1.0 + (v_f / STEER_SPEED_REF).powi(2));
-        self.steering += (steer_target - self.steering) * (1.0 - (-STEER_RESPONSE * dt).exp());
+        let steer_kin = -c.steering * MAX_STEER_ANGLE / (1.0 + (v_f / STEER_SPEED_REF).powi(2));
+        let mut steer_target = steer_kin;
 
         // World-vertical heading change from steering (grounded only).
         let mut steer_yaw = 0.0_f32;
         if any_ground {
-            // Drive and brake forces act at the tyre patches, below the centre of mass: drive
-            // pitches up, braking pitches down. Each wheel's share is limited by its strut load,
-            // so an unloading wheel (rear under hard braking) fades out continuously.
+            // Each tyre has one grip budget, `GROUND_MU` times its strut load, shared by the
+            // drive/brake force and the force that removes sideways slip. Together they are scaled
+            // back to the budget (a friction circle), so braking in a corner costs cornering and
+            // a tyre whose load fades out lets go continuously. Drive and brake forces act at the
+            // tyre patches, below the centre of mass: drive pitches up, braking pitches down.
             let along = Vec3::new(heading.x, 0.0, heading.y);
             let mut ground_torque = Vec3::ZERO;
+            let mut drive = 0.0;
             if c.pedal > 0.0 {
                 let power = if c.sprint { p.sprint_power } else { p.power };
                 let cap = PEDAL_FORCE * p.power / PEDAL_POWER;
@@ -1051,16 +1073,32 @@ impl Bike {
                 } else {
                     cap
                 };
-                let drive = (ceiling * c.pedal).min(GROUND_MU * force[1]);
-                v_f += drive * dt;
-                ground_torque += contacts[1].lever.cross(along * drive);
+                drive = ceiling * c.pedal;
             }
+            let brake = [BRAKE_FRONT, BRAKE_REAR].map(|share| share * BRAKE_DECEL * c.brake);
+            let slip_decay = (TIRE_GRIP * p.tire_width * dt).min(1.0);
+            let slip = slip_decay * v_l.abs() / dt;
+            let load = (force[0] + force[1]).max(1e-6);
+            let motion = v_f.signum();
+            let mut grip = [1.0_f32; 2];
+            let mut front_use = 0.0;
+            for i in 0..2 {
+                let longitudinal = if i == 1 { drive } else { 0.0 } - motion * brake[i];
+                let demand = longitudinal.hypot(force[i] / load * slip);
+                let budget = GROUND_MU * force[i];
+                if demand > budget {
+                    grip[i] = budget / demand;
+                }
+                if i == 0 {
+                    front_use = demand / budget.max(1e-6);
+                }
+            }
+            let drive = drive * grip[1];
+            v_f += drive * dt;
+            ground_torque += contacts[1].lever.cross(along * drive);
             // Resistances clamp at zero: a settled bike stays settled and brakes never reverse it.
             v_f -= v_f.signum() * (ROLLING_RESISTANCE * p.tire_width * dt).min(v_f.abs());
-            let held = [
-                (BRAKE_FRONT * BRAKE_DECEL * c.brake).min(GROUND_MU * force[0]),
-                (BRAKE_REAR * BRAKE_DECEL * c.brake).min(GROUND_MU * force[1]),
-            ];
+            let held = [brake[0] * grip[0], brake[1] * grip[1]];
             let total = held[0] + held[1];
             let sign = v_f.signum();
             let dv = (total * dt).min(v_f.abs());
@@ -1073,19 +1111,43 @@ impl Bike {
             }
             pitch_acc += to_pitch(ground_torque);
 
-            v_l -= v_l * (TIRE_GRIP * p.tire_width * dt).min(1.0);
-            let yaw_limit = MAX_LATERAL_ACCEL / v_f.abs().max(1.0);
-            let yaw_rate = (v_f * self.steering.tan() / WHEELBASE).clamp(-yaw_limit, yaw_limit);
+            // The slip the tyres actually remove; what the budget cannot hold stays as drift.
+            let grip_lateral = (force[0] * grip[0] + force[1] * grip[1]) / load;
+            v_l -= v_l * slip_decay * grip_lateral;
+            // A front tyre that cannot hold its share while sliding sideways is washing out.
+            let over = if grounded[0] && v_l.abs() > WASH_SLIP {
+                ((front_use - 1.0) / WASH_OVERLOAD).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            self.front_slide = (self.front_slide + dt * (2.0 * over - 1.0)).max(0.0);
+
+            // Turning. At walking pace the front wheel angle sets the yaw rate directly. At speed
+            // the rider's input sets a target lean, the bike rolls toward it (rate limited), and
+            // the yaw rate follows the lean: g tan(lean) = v w. Rolling in needs a brief steer
+            // away from the turn, so the yaw rate carries a term against the roll rate.
+            let blend = smoothstep(LEAN_STEER_SPEED.0, LEAN_STEER_SPEED.1, v_f);
+            let kinematic = v_f * self.steering.tan() / WHEELBASE;
+            let lean = self.roll.clamp(-MAX_LEAN, MAX_LEAN);
+            let led =
+                GRAVITY * lean.tan() / v_f.max(LEAN_STEER_SPEED.0) - COUNTERSTEER * self.roll_rate;
+            let yaw_rate = kinematic + blend * (led - kinematic);
             steer_yaw = yaw_rate;
-            // Velocity turns with the heading, preserving speed.
+            // The front wheel angle that geometry gives this yaw rate: the bars show the countersteer.
+            let geometric = (WHEELBASE * yaw_rate / v_f.max(LEAN_STEER_SPEED.0)).atan();
+            steer_target += blend * (geometric - steer_kin);
+            // The heading turns, the velocity follows only as far as the tyres hold it.
             v_h = heading * v_f + right * v_l;
-            let (s, co) = (yaw_rate * dt).sin_cos();
-            v_h = Vec2::new(v_h.x * co + v_h.y * s, -v_h.x * s + v_h.y * co);
             self.velocity.x = v_h.x;
             self.velocity.z = v_h.y;
 
-            let lean = (LEAN_GAIN * (v_f * yaw_rate / GRAVITY).atan()).clamp(-MAX_LEAN, MAX_LEAN);
-            self.roll_rate = (lean - self.roll) * (1.0 - (-LEAN_RESPONSE * dt).exp()) / dt;
+            let lean_target = (-c.steering * MAX_LEAN * blend
+                + (1.0 - blend) * (v_f * kinematic / GRAVITY).atan())
+            .clamp(-MAX_LEAN, MAX_LEAN);
+            let roll_rate_target =
+                (ROLL_RESPONSE * (lean_target - self.roll)).clamp(-MAX_ROLL_RATE, MAX_ROLL_RATE);
+            self.roll_rate +=
+                (roll_rate_target - self.roll_rate) * (1.0 - (-ROLL_ACCEL_RESPONSE * dt).exp());
 
             let balance = c.manual || c.nose_manual;
             if c.wheelie && grounded[1] && !balance {
@@ -1153,7 +1215,9 @@ impl Bike {
                 - AIR_ROLL_DAMP * assist * self.roll_rate)
                 * dt;
             self.wheel_omega *= 1.0 - AIR_WHEEL_DECAY * dt;
+            self.front_slide = 0.0;
         }
+        self.steering += (steer_target - self.steering) * (1.0 - (-STEER_RESPONSE * dt).exp());
 
         self.pitch_rate += pitch_acc * dt;
         let mut q = self.rot * Quat::from_scaled_axis(self.angular_velocity() * dt);
@@ -1197,27 +1261,27 @@ impl Bike {
             self.suspension[i] = contacts[i].compression.clamp(0.0, MAX_COMPRESSION);
             self.grounded[i] = contacts[i].compression > 0.0;
         }
-        // One wheel down and pitched past the point of no return: the rider falls off.
+        // Rider fallen: the front slid out in a corner, or one wheel is down and pitched past the
+        // point of no return.
+        let mut reason = (self.front_slide > WASH_TIME).then_some(CrashReason::Washout);
         if self.grounded[0] != self.grounded[1] {
             let i = usize::from(self.grounded[1]);
             let heading = Vec2::new(-self.yaw.sin(), -self.yaw.cos());
             let rel = self.pitch - contacts[i].slope.dot(heading).atan();
-            let reason = if i == 1 && rel > TIP_OVER_PITCH {
-                Some(CrashReason::LoopedOut)
+            if i == 1 && rel > TIP_OVER_PITCH {
+                reason = Some(CrashReason::LoopedOut);
             } else if i == 0 && rel < -TIP_OVER_PITCH {
-                Some(CrashReason::OverTheBars)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                self.crash = Some(Crash {
-                    reason,
-                    impact: 0.0,
-                    elapsed: 0.0,
-                });
-                self.crash_substep(0.0);
-                return;
+                reason = Some(CrashReason::OverTheBars);
             }
+        }
+        if let Some(reason) = reason {
+            self.crash = Some(Crash {
+                reason,
+                impact: 0.0,
+                elapsed: 0.0,
+            });
+            self.crash_substep(0.0);
+            return;
         }
         self.air_time = if self.grounded[0] || self.grounded[1] {
             0.0
@@ -1421,6 +1485,107 @@ mod tests {
                 b.position.x
             );
             assert!(b.yaw * side < -0.3 && b.roll * side < -0.1 && b.steering * side < 0.0);
+        }
+    }
+
+    fn rolling(speed: f32) -> Bike {
+        let mut b = Bike::default();
+        b.reset_at(0.0, 8.0, speed);
+        b
+    }
+
+    /// Angle between the travel direction and the heading, radians.
+    fn slip_angle(b: &Bike) -> f32 {
+        (b.velocity.x * b.yaw.cos() - b.velocity.z * b.yaw.sin())
+            .atan2(forward_speed(b))
+            .abs()
+    }
+
+    fn corner(brake: f32) -> Controls {
+        Controls {
+            steering: 1.0,
+            brake,
+            ..Controls::default()
+        }
+    }
+
+    /// Braking hard in a corner costs the corner (the front tyre has one grip budget for both),
+    /// while braking straight, every profile, stops without crashing.
+    #[test]
+    fn braking_in_a_corner_slides_but_braking_straight_stops_fine() {
+        for &d in Discipline::ALL {
+            let mut b = select(d);
+            b.reset_at(0.0, 8.0, 12.0);
+            let brake = Controls {
+                brake: 1.0,
+                ..Controls::default()
+            };
+            run(&mut b, brake, 3.0);
+            assert!(b.crash.is_none(), "{d:?} crashed braking straight");
+            assert!(b.velocity.length() < 0.1, "{d:?} still moving");
+        }
+        let (mut free, mut braked) = (rolling(12.0), rolling(12.0));
+        run(&mut free, corner(0.0), 1.0);
+        run(&mut braked, corner(0.0), 1.0);
+        let (mut slip_free, mut slip_braked) = (0.0_f32, 0.0_f32);
+        for _ in 0..(0.75 / DT) as usize {
+            free.step(&corner(0.0), DT);
+            braked.step(&corner(1.0), DT);
+            slip_free = slip_free.max(slip_angle(&free));
+            slip_braked = slip_braked.max(slip_angle(&braked));
+        }
+        assert!(slip_free < 0.04 && slip_braked > 0.08);
+    }
+
+    /// A step steer input first turns the bike the other way (countersteer rolls it in), then the
+    /// lean settles and the turn follows it: tan(lean) = v w / g. The bars show the countersteer.
+    #[test]
+    fn leaning_in_countersteers_first_then_turns_with_the_lean() {
+        let mut b = rolling(10.0);
+        run(&mut b, Controls::default(), 1.0);
+        let right = Controls {
+            steering: 1.0,
+            ..Controls::default()
+        };
+        let (mut bars, mut yaw) = (0.0_f32, 0.0_f32);
+        for _ in 0..(0.3 / DT) as usize {
+            b.step(&right, DT);
+            bars = bars.max(b.steering);
+            yaw = yaw.max(b.yaw);
+        }
+        assert!(bars > 0.01 && yaw > 0.005, "bars {bars} yaw {yaw}");
+        run(&mut b, right, 1.5);
+        let before = b.yaw;
+        b.step(&right, DT);
+        let rate = (b.yaw - before) / DT;
+        let lean = (forward_speed(&b) * rate / GRAVITY).atan();
+        assert!(b.steering < 0.0 && rate < -0.3 && (b.roll - lean).abs() < 0.03);
+    }
+
+    /// Cornering demand past the front tyre's grip (braking at speed in a full-lean turn) washes
+    /// the front out; riding and cornering normally, at any profile, never does.
+    #[test]
+    fn sustained_front_overload_washes_out_but_normal_riding_does_not() {
+        let mut b = rolling(12.0);
+        run(&mut b, corner(0.0), 1.0);
+        run(&mut b, corner(1.0), 2.0);
+        assert_eq!(b.crash.map(|c| c.reason), Some(CrashReason::Washout));
+
+        for &d in Discipline::ALL {
+            for (steering, brake, sprint) in
+                [(1.0, 0.0, false), (-1.0, 0.3, false), (1.0, 0.0, true)]
+            {
+                let mut b = select(d);
+                b.reset_at(0.0, 8.0, 12.0);
+                let c = Controls {
+                    steering,
+                    brake,
+                    sprint,
+                    ..pedal()
+                };
+                run(&mut b, c, 3.0);
+                assert!(b.crash.is_none(), "{d:?} {steering} {brake} crashed");
+            }
         }
     }
 

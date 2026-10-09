@@ -678,7 +678,11 @@ impl Skier {
             (wrap(target - self.heading) * HOCKEY_RATE).clamp(-HOCKEY_RATE, HOCKEY_RATE)
         } else {
             let pivot = 1.0 - smoothstep(1.5, 6.0, s);
-            -v.dot(f) * self.edge.sin() / SIDECUT_RADIUS - c.steer * PIVOT_RATE * pivot
+            // A pressed, edged ski bends into its sidecut and carves radius R_sc cos(edge)
+            // (Howe); a flat ski only pivots, so the carve engages over a few degrees of edge.
+            let engage = smoothstep(0.05, 0.4, self.edge.abs());
+            -v.dot(f) * self.edge.signum() * engage / (SIDECUT_RADIUS * self.edge.cos())
+                - c.steer * PIVOT_RATE * pivot
         };
         self.turn_rate += (turn_target - self.turn_rate) * ease(TURN_RESPONSE, h);
         self.heading = wrap(self.heading + self.turn_rate * h);
@@ -1025,6 +1029,40 @@ mod tests {
         );
         assert!(s.skid < 0.3 && s.lean > 0.05 && s.edge > 0.3);
         assert!(s.speed() > 8.0);
+    }
+
+    /// Steady carve at 30 degrees edge: radius R_sc cos(edge) while grip holds, a wider skidded
+    /// arc once v^2 / R exceeds the edge grip.
+    #[test]
+    fn carve_radius_follows_sidecut_cosine_and_skids_when_grip_runs_out() {
+        let radius = |speed: f32| {
+            let mut s = flat(speed);
+            let c = SkiControls {
+                steer: 0.5236 / (0.4 + 0.6 * smoothstep(1.0, 8.0, speed)),
+                ..default_controls()
+            };
+            run(&mut s, &c, 1.5);
+            assert!((s.edge - 0.5236).abs() < 0.02, "edge {}", s.edge);
+            let mut turn = 0.0;
+            let mut speed = 0.0;
+            let mut skid = 0.0;
+            for _ in 0..30 {
+                run(&mut s, &c, DT);
+                turn += s.turn_rate.abs();
+                speed += s.speed();
+                skid += s.skid;
+            }
+            (speed / turn, skid / 30.0, s.edge)
+        };
+        let (r, skid, edge) = radius(8.0);
+        let ideal = SIDECUT_RADIUS * edge.cos();
+        assert!((r / ideal - 1.0).abs() < 0.15, "radius {r} vs {ideal}");
+        assert!(skid < 0.1, "skid {skid}");
+        let (r_fast, skid_fast, _) = radius(16.0);
+        assert!(
+            skid_fast > 0.1 && r_fast > 1.15 * ideal,
+            "{r_fast} {skid_fast}"
+        );
     }
 
     #[test]

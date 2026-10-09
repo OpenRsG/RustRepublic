@@ -265,6 +265,14 @@
     ui.classList.toggle('touch', touch);
     refresh();
 
+    // Browsers start an AudioContext made before any click suspended; resume the game's on the first gesture.
+    const contexts = [];
+    window.AudioContext = class extends window.AudioContext {
+      constructor(...args) { super(...args); contexts.push(this); }
+    };
+    const wake = () => contexts.forEach((c) => c.state === 'suspended' && c.resume());
+    for (const type of ['pointerdown', 'keydown', 'touchend']) addEventListener(type, wake, { capture: true });
+
     // Loading screen: script, wasm download (counted as it streams into the compiler), compile, GPU start.
     const [stage, fill, detail] = ['stage', 'fill', 'detail'].map((id) => document.getElementById(id));
     const show = (text, done, info = '', busy = true) => {
@@ -278,10 +286,15 @@
       show('Loading game script', .02);
       const game = await import('./rider-rep-rust.js');
       show('Downloading game', .04);
-      const res = await fetch('./rider-rep-rust_bg.wasm');
+      // scripts/web.sh also writes a gzipped copy (about a quarter of the size); the browser
+      // unpacks it, so this works on static hosts that don't compress.
+      let res = 'DecompressionStream' in window ? await fetch('./rider-rep-rust_bg.wasm.gz') : null;
+      const gz = res?.ok;
+      if (!gz) res = await fetch('./rider-rep-rust_bg.wasm');
       if (!res.ok) throw new Error(`${res.status} ${res.statusText} fetching the game`);
       // A compressed transfer's Content-Length is not the byte count the stream yields.
-      const total = res.headers.get('Content-Encoding') ? 0 : +res.headers.get('Content-Length') || 0;
+      const encoding = res.headers.get('Content-Encoding');
+      const total = encoding ? 0 : +res.headers.get('Content-Length') || 0;
       let got = 0;
       const counted = res.body.pipeThrough(new TransformStream({
         transform(chunk, out) {
@@ -292,7 +305,9 @@
         },
         flush() { show('Compiling WebAssembly', .9, `${mb(got)} MB`); },
       }));
-      await game.default({ module_or_path: new Response(counted, { headers: { 'Content-Type': 'application/wasm' } }) });
+      // A server that already decoded the .gz (Content-Encoding: gzip) hands over the wasm itself.
+      const body = gz && !/gzip/.test(encoding ?? '') ? counted.pipeThrough(new DecompressionStream('gzip')) : counted;
+      await game.default({ module_or_path: new Response(body, { headers: { 'Content-Type': 'application/wasm' } }) });
       show('Starting WebGPU and building the world', .96);
     }
 
