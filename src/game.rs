@@ -3,6 +3,8 @@ use crate::bike::{Bike, BikeTrick, Controls, Discipline, HandTrick, LegTrick, te
 use crate::scene;
 use crate::showcase::{Showcase, Stage};
 use crate::ski;
+use bevy::anti_alias::smaa::Smaa;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::InputSystems;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
@@ -232,6 +234,7 @@ pub fn run() {
             }),
             ..default()
         }))
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(Time::<Fixed>::from_hz(120.0))
         .init_resource::<Bike>()
         .init_resource::<Controls>()
@@ -244,6 +247,7 @@ pub fn run() {
         .init_resource::<Showcase>()
         .add_plugins(crate::ski::SkiPlugin)
         .add_plugins(crate::audio::SoundPlugin)
+        .add_plugins(crate::tracks::TracksPlugin)
         .add_systems(Startup, (scene::setup_scene, setup_view))
         .add_systems(
             PreUpdate,
@@ -277,7 +281,12 @@ fn setup_view(mut commands: Commands, bike: Res<Bike>) {
         }),
         Transform::from_translation(bike.position + Vec3::new(0.0, 2.0, 5.5))
             .looking_at(bike.position + Vec3::Y, Vec3::Y),
+        // SMAA and SSAO both need single-sampled targets. SSAO's compute passes need five storage
+        // textures per stage, which WebGPU's default limits do not offer, so it is native-only.
         Msaa::Off,
+        Smaa::default(),
+        #[cfg(not(target_arch = "wasm32"))]
+        bevy::pbr::ScreenSpaceAmbientOcclusion::default(),
         RideCamera,
     ));
 
@@ -893,6 +902,7 @@ fn update_hud(
     showcase: Res<Showcase>,
     ragdoll: Res<crate::ragdoll::Ragdoll>,
     ski: ski::SkiView,
+    diagnostics: Res<DiagnosticsStore>,
     mut text: Query<&mut Text, With<Telemetry>>,
     mut help: Query<&mut Visibility, With<ControlHelp>>,
     mut cooldown: Local<f32>,
@@ -912,6 +922,11 @@ fn update_hud(
     let Ok(mut text) = text.single_mut() else {
         return;
     };
+    let frame_ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+    let perf = format!("{:.0} fps / {frame_ms:.1} ms", 1000.0 / frame_ms.max(0.01));
     if let Some(hud) = ski.hud(
         status.paused,
         status.focused,
@@ -919,7 +934,7 @@ fn update_hud(
         skeleton.rider_mesh,
     ) {
         text.0 = format!(
-            "{hud}\nCamera {:+.0} deg   {:.1} m{}",
+            "{hud}\n{perf}\nCamera {:+.0} deg   {:.1} m{}",
             wrap_angle(chase.yaw - ski.follow().map_or(0.0, |f| f.yaw)).to_degrees(),
             chase.distance,
             if chase.orbiting { "   orbiting" } else { "" }
@@ -952,7 +967,7 @@ fn update_hud(
     }
     let on_off = |on: bool| if on { "on" } else { "off" };
     text.0 = format!(
-        "{}   {:>3.0} km/h   |   {}\n{} {} {}\nAnimation: {} / {}\nTricks U/I/O: {} + {} + {} ({})\nActive: {} + {} + {} {}\nFront {}   Rear {}   |   {:.0} m traveled\nSkeleton {} (F1)   Rider mesh {} (F2)\nCamera {:+.0} deg   {:.1} m{}",
+        "{}   {:>3.0} km/h   |   {}\n{} {} {}\nAnimation: {} / {}\nTricks U/I/O: {} + {} + {} ({})\nActive: {} + {} + {} {}\nFront {}   Rear {}   |   {:.0} m traveled\nSkeleton {} (F1)   Rider mesh {} (F2)\n{perf}\nCamera {:+.0} deg   {:.1} m{}",
         bike.discipline.label(),
         bike.velocity.x.hypot(bike.velocity.z) * 3.6,
         mode,

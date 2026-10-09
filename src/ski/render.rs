@@ -1,11 +1,18 @@
-//! Skier rendering: world-space body, ski and pole meshes driven by the solved `SkierPose`, the
+//! Skier rendering: the skinned body, ski and pole meshes driven by the solved `SkierPose`, the
 //! debug skeleton overlay (same colours as the bike) and gizmo snow spray.
 //!
-//! Every mesh is a unit cube / cylinder / sphere stretched each frame; nothing is parented.
+//! The body is one skinned mesh set (see `body`) posed in world space; skis, poles, helmet and
+//! goggles are unit cube / cylinder / sphere meshes stretched each frame. Nothing is parented.
 
+use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;
 
-use super::pose::{BONES, GEAR, J, SKI_THICKNESS, SKI_WIDTH, Side, SkierPose, side};
+use super::pose::{
+    ANKLE_ABOVE_SKI, BONES, GEAR, HEEL_BACK, J, SKI_THICKNESS, SKI_WIDTH, Side, SkierPose,
+    TOE_FORWARD, side,
+};
+use crate::body;
+use crate::tracks::{SKI_TRACK_WIDTH, Tracks};
 
 // ---------------------------------------------------------------------------------------------
 // Authored look
@@ -48,16 +55,6 @@ pub(crate) enum SkierPart {
         dx: f32,
         dz: f32,
     },
-    /// Unit cube from `a` to `b` whose Z axis follows `pose.facing` (or the ski's top normal when
-    /// `ski` is set), raised by `lift` along that axis. Torso, hips and boots.
-    Slab {
-        a: J,
-        b: J,
-        dx: f32,
-        dz: f32,
-        lift: f32,
-        ski: Option<bool>,
-    },
     /// `len` long tube from `from` towards `toward`.
     Stub {
         from: J,
@@ -66,8 +63,6 @@ pub(crate) enum SkierPart {
         dx: f32,
         dz: f32,
     },
-    /// Sphere of the given radius centred on a joint.
-    Ball(J, f32),
     Helmet,
     Goggles,
     /// Flat part of a ski, tail to the start of the shovel.
@@ -94,9 +89,8 @@ impl SkierPart {
     fn joints(self) -> Vec<J> {
         use SkierPart::*;
         match self {
-            Link { a, b, .. } | Slab { a, b, .. } => vec![a, b],
+            Link { a, b, .. } => vec![a, b],
             Stub { from, toward, .. } => vec![from, toward],
-            Ball(j, _) => vec![j],
             Helmet | Goggles => vec![J::Head, J::Neck],
             Ski { left } | Shovel { left } => ski_joints(left).to_vec(),
             Binding { left } => ski_joints(left).to_vec(),
@@ -105,9 +99,56 @@ impl SkierPart {
     }
 }
 
-/// Body meshes: hidden by the F2 rider-mesh switch. Skis and poles are gear and stay visible.
+/// Helmet and goggles: hidden by the F2 rider-mesh switch like the skinned body. Skis and poles
+/// are gear and stay visible.
 #[derive(Component)]
 pub(crate) struct SkierBody;
+
+/// Root of the skinned body; its `Visibility` shows or hides all of it.
+#[derive(Component)]
+pub(crate) struct SkierSkin;
+
+/// Skin joint of the skier's body (world space).
+#[derive(Component, Clone)]
+pub(crate) struct SkierJoint;
+
+/// The skier's pose as a skin pose.
+fn body_pose(pose: &SkierPose) -> body::Pose {
+    use body::Pt;
+    let points = [
+        (Pt::Pelvis, J::Pelvis),
+        (Pt::HipL, J::HipL),
+        (Pt::HipR, J::HipR),
+        (Pt::KneeL, J::KneeL),
+        (Pt::KneeR, J::KneeR),
+        (Pt::AnkleL, J::AnkleL),
+        (Pt::AnkleR, J::AnkleR),
+        (Pt::HeelL, J::HeelL),
+        (Pt::HeelR, J::HeelR),
+        (Pt::ToeL, J::ToeL),
+        (Pt::ToeR, J::ToeR),
+        (Pt::Waist, J::Waist),
+        (Pt::Chest, J::Chest),
+        (Pt::Neck, J::Neck),
+        (Pt::Head, J::Head),
+        (Pt::ShoulderL, J::ShoulderL),
+        (Pt::ShoulderR, J::ShoulderR),
+        (Pt::ElbowL, J::ElbowL),
+        (Pt::ElbowR, J::ElbowR),
+        (Pt::WristL, J::WristL),
+        (Pt::WristR, J::WristR),
+        (Pt::HandL, J::HandL),
+        (Pt::HandR, J::HandR),
+    ];
+    let mut out = body::Pose {
+        p: [Vec3::ZERO; Pt::N as usize],
+        head: frame(pose[J::Head] - pose[J::Neck], -pose.gaze),
+    };
+    for (to, from) in points {
+        out.p[to as usize] = pose[from];
+    }
+    out
+}
 
 /// Handle of the jacket material (shared by torso and sleeves) for the crash tint.
 #[derive(Resource)]
@@ -174,19 +215,6 @@ fn part_tf(part: SkierPart, pose: &SkierPose) -> Transform {
     let head_up = (pose[J::Head] - pose[J::Neck]).normalize_or(Vec3::Y);
     match part {
         Link { a, b, dx, dz } => tube_tf(pose[a], pose[b], dx, dz),
-        Slab {
-            a,
-            b,
-            dx,
-            dz,
-            lift,
-            ski,
-        } => {
-            let hint = ski.map_or(pose.facing, |left| pose.ski_up[ski_index(left)]);
-            let mut tf = oriented_tf(pose[a], pose[b], hint, dx, dz);
-            tf.translation += tf.rotation * Vec3::Z * lift;
-            tf
-        }
         Stub {
             from,
             toward,
@@ -198,7 +226,6 @@ fn part_tf(part: SkierPart, pose: &SkierPose) -> Transform {
             let d = (pose[toward] - a).normalize_or(Vec3::Y);
             tube_tf(a, a + d * len, dx, dz)
         }
-        Ball(j, r) => Transform::from_translation(pose[j]).with_scale(Vec3::splat(2.0 * r)),
         Helmet => {
             let rotation = frame(head_up, -pose.gaze);
             Transform {
@@ -263,6 +290,7 @@ fn mat(
 pub fn spawn_skier(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     use SkierPart::*;
@@ -285,6 +313,24 @@ pub fn spawn_skier(
         jacket: jacket.clone(),
     });
 
+    let root = commands
+        .spawn((SkierSkin, Transform::default(), Visibility::Hidden))
+        .id();
+    body::spawn(
+        &mut commands,
+        &mut meshes,
+        &mut bindposes,
+        root,
+        body::Style {
+            sole: ANKLE_ABOVE_SKI,
+            heel: HEEL_BACK,
+            toe: TOE_FORWARD,
+            cuff: 0.2,
+        },
+        [jacket.clone(), pants, skin, boot, glove],
+        SkierJoint,
+    );
+
     let mut put =
         |mesh: &Handle<Mesh>, m: &Handle<StandardMaterial>, part: SkierPart, body: bool| {
             let mut e = commands.spawn((
@@ -300,132 +346,15 @@ pub fn spawn_skier(
         };
     let link = |a, b, dx, dz| Link { a, b, dx, dz };
 
-    // Pelvis, torso and neck.
-    put(
-        &cube,
-        &pants,
-        Slab {
-            a: J::Pelvis,
-            b: J::Waist,
-            dx: 0.30,
-            dz: 0.20,
-            lift: 0.0,
-            ski: None,
-        },
-        true,
-    );
-    put(
-        &cube,
-        &jacket,
-        Slab {
-            a: J::Waist,
-            b: J::Chest,
-            dx: 0.34,
-            dz: 0.21,
-            lift: 0.0,
-            ski: None,
-        },
-        true,
-    );
-    put(
-        &cube,
-        &jacket,
-        Slab {
-            a: J::Chest,
-            b: J::Neck,
-            dx: 0.40,
-            dz: 0.22,
-            lift: 0.0,
-            ski: None,
-        },
-        true,
-    );
-    put(&cyl, &skin, link(J::Neck, J::Head, 0.08, 0.08), true);
-    put(&ball, &skin, Ball(J::Head, 0.0825), true);
     put(&ball, &helmet, Helmet, true);
     put(&cube, &lens, Goggles, true);
 
     for left in [true, false] {
-        let (hip, knee, ankle, heel, toe, shoulder, elbow, wrist, hand, top, tip) = if left {
-            (
-                J::HipL,
-                J::KneeL,
-                J::AnkleL,
-                J::HeelL,
-                J::ToeL,
-                J::ShoulderL,
-                J::ElbowL,
-                J::WristL,
-                J::HandL,
-                J::PoleTopL,
-                J::PoleTipL,
-            )
+        let (top, tip) = if left {
+            (J::PoleTopL, J::PoleTipL)
         } else {
-            (
-                J::HipR,
-                J::KneeR,
-                J::AnkleR,
-                J::HeelR,
-                J::ToeR,
-                J::ShoulderR,
-                J::ElbowR,
-                J::WristR,
-                J::HandR,
-                J::PoleTopR,
-                J::PoleTipR,
-            )
+            (J::PoleTopR, J::PoleTipR)
         };
-        // Legs and boots.
-        put(&cyl, &pants, link(J::Pelvis, hip, 0.14, 0.14), true);
-        put(&cyl, &pants, link(hip, knee, 0.15, 0.15), true);
-        put(&ball, &pants, Ball(knee, 0.075), true);
-        put(&cyl, &pants, link(knee, ankle, 0.115, 0.115), true);
-        put(
-            &cyl,
-            &boot,
-            Stub {
-                from: ankle,
-                toward: knee,
-                len: 0.20,
-                dx: 0.14,
-                dz: 0.14,
-            },
-            true,
-        );
-        put(
-            &cube,
-            &boot,
-            Slab {
-                a: ankle,
-                b: toe,
-                dx: 0.115,
-                dz: 0.10,
-                lift: 0.05,
-                ski: Some(left),
-            },
-            true,
-        );
-        put(
-            &cube,
-            &boot,
-            Slab {
-                a: heel,
-                b: ankle,
-                dx: 0.115,
-                dz: 0.10,
-                lift: 0.05,
-                ski: Some(left),
-            },
-            true,
-        );
-        // Arms and gloves.
-        put(&cyl, &jacket, link(J::Chest, shoulder, 0.10, 0.10), true);
-        put(&ball, &jacket, Ball(shoulder, 0.06), true);
-        put(&cyl, &jacket, link(shoulder, elbow, 0.095, 0.095), true);
-        put(&ball, &jacket, Ball(elbow, 0.05), true);
-        put(&cyl, &jacket, link(elbow, wrist, 0.08, 0.08), true);
-        put(&cyl, &glove, link(wrist, hand, 0.075, 0.075), true);
-        put(&ball, &glove, Ball(hand, 0.055), true);
         // Skis, bindings and poles.
         put(&cube, &ski, Ski { left }, false);
         put(&cube, &ski, Shovel { left }, false);
@@ -531,10 +460,16 @@ pub fn animate_skier(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut crash_tint: Local<Option<bool>>,
     mut parts: Query<(&SkierPart, &mut Transform, &mut Visibility, Has<SkierBody>)>,
+    mut skin: Query<&mut Visibility, (With<SkierSkin>, Without<SkierPart>)>,
+    mut joints: Query<(&body::SkinJoint, &mut Transform), (With<SkierJoint>, Without<SkierPart>)>,
+    mut tracks: ResMut<Tracks>,
     mut gizmos: Gizmos,
 ) {
     if *sport != super::Sport::Ski {
         for (_, _, mut v, _) in &mut parts {
+            v.set_if_neq(Visibility::Hidden);
+        }
+        for mut v in &mut skin {
             v.set_if_neq(Visibility::Hidden);
         }
         return;
@@ -558,8 +493,25 @@ pub fn animate_skier(
             Visibility::Inherited
         });
     }
+    for mut v in &mut skin {
+        v.set_if_neq(if debug.rider_mesh {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+    }
+    body::pose_joints(&body_pose(&pose), &mut joints);
     if debug.enabled {
         draw_skeleton(&mut gizmos, &pose, debug.rider_mesh, crashed);
+    }
+    let on_snow = skier.grounded && !crashed && !ragdoll.active();
+    for (i, bind) in [J::BindL, J::BindR].into_iter().enumerate() {
+        tracks.lay(
+            i,
+            on_snow.then_some(pose[bind]),
+            SKI_TRACK_WIDTH,
+            time.elapsed_secs(),
+        );
     }
 
     // Snow spray: sideways from the tails in a skid, outward from the wedge when snowploughing.
@@ -601,6 +553,7 @@ mod tests {
     fn spawned_parts() -> Vec<SkierPart> {
         let mut world = World::new();
         world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<SkinnedMeshInverseBindposes>>();
         world.init_resource::<Assets<StandardMaterial>>();
         world.run_system_once(spawn_skier).unwrap();
         let parts: Vec<_> = world.query::<&SkierPart>().iter(&world).copied().collect();
@@ -688,8 +641,17 @@ mod tests {
             J::PoleTipR,
         ];
         assert_eq!(all.len(), JOINTS);
+        // The skinned body draws the body joints, the parts the equipment.
+        let mut p = [Vec3::ZERO; JOINTS];
+        for (i, v) in p.iter_mut().enumerate() {
+            *v = Vec3::splat(i as f32 + 1.0);
+        }
+        let skinned = body_pose(&SkierPose::from_points(p)).p;
         for j in all {
-            assert!(seen[j as usize], "{j:?} has no mesh");
+            assert!(
+                seen[j as usize] || skinned.contains(&p[j as usize]),
+                "{j:?} has no mesh"
+            );
         }
     }
 

@@ -9,6 +9,7 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::light::CascadeShadowConfigBuilder;
+use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -23,7 +24,9 @@ use crate::bike::{
     Bike, CollisionPose, CollisionSphere, Discipline, SUSPENSION_REST, WHEEL_RADIUS, WHEELBASE,
     terrain_height,
 };
+use crate::body;
 use crate::ragdoll::{COUNT, Ragdoll};
+use crate::surface;
 
 // ---------------------------------------------------------------------------------------------
 // Bike geometry (meters, bike-local). Hubs come from the Bike contract; the rest is fixed here.
@@ -944,6 +947,48 @@ fn draw_skeleton(g: &mut Gizmos, origin: Vec3, q: Quat, r: &Rig, over_mesh: bool
     }
 }
 
+/// Skin joint of the bike rider's body.
+#[derive(Component, Clone)]
+pub(crate) struct RiderJoint;
+
+/// The rider's solved points as a skin pose (bike-local).
+fn body_pose(r: &Rig) -> body::Pose {
+    use body::Pt;
+    let mut pose = body::Pose {
+        p: [Vec3::ZERO; Pt::N as usize],
+        head: r.head_rot,
+    };
+    let points = [
+        (Pt::Pelvis, P::Hip),
+        (Pt::HipL, P::HipL),
+        (Pt::HipR, P::HipR),
+        (Pt::KneeL, P::KneeL),
+        (Pt::KneeR, P::KneeR),
+        (Pt::AnkleL, P::AnkleL),
+        (Pt::AnkleR, P::AnkleR),
+        (Pt::HeelL, P::HeelL),
+        (Pt::HeelR, P::HeelR),
+        (Pt::ToeL, P::ToeL),
+        (Pt::ToeR, P::ToeR),
+        (Pt::Waist, P::Waist),
+        (Pt::Chest, P::Shoulder),
+        (Pt::Neck, P::Neck),
+        (Pt::Head, P::Head),
+        (Pt::ShoulderL, P::ShoulderL),
+        (Pt::ShoulderR, P::ShoulderR),
+        (Pt::ElbowL, P::ElbowL),
+        (Pt::ElbowR, P::ElbowR),
+        (Pt::WristL, P::WristL),
+        (Pt::WristR, P::WristR),
+        (Pt::HandL, P::HandL),
+        (Pt::HandR, P::HandR),
+    ];
+    for (to, from) in points {
+        pose.p[to as usize] = r[from];
+    }
+    pose
+}
+
 /// Every animated entity carries one of these; `animate_bike` updates all in a single query.
 #[derive(Component, Clone, Copy)]
 pub(crate) enum Part {
@@ -1162,7 +1207,8 @@ pub fn animate_bike(
     paint: Res<BikePaint>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut dressed: Local<Option<(Discipline, bool)>>,
-    mut parts: Query<(&Part, &mut Transform)>,
+    mut parts: Query<(&Part, &mut Transform), Without<RiderJoint>>,
+    mut joints: Query<(&body::SkinJoint, &mut Transform), (With<RiderJoint>, Without<Part>)>,
     mut rider: Query<&mut Visibility, With<RiderMesh>>,
     mut gear: Query<(&Gear, &mut Visibility), Without<RiderMesh>>,
     mut gizmos: Gizmos,
@@ -1229,6 +1275,7 @@ pub fn animate_bike(
             }
         }
     }
+    body::pose_joints(&body_pose(&rig), &mut joints);
     let shown = if debug.rider_mesh {
         Visibility::Inherited
     } else {
@@ -1256,7 +1303,9 @@ pub fn animate_bike(
 pub fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut gizmo_config: ResMut<GizmoConfigStore>,
 ) {
     // Skeleton lines always draw over the (much thicker) body geometry.
@@ -1289,8 +1338,10 @@ pub fn setup_scene(
         Transform::default().looking_to(-sun, Vec3::Y),
     ));
 
+    let (grain, bump) = surface::grain();
     let floor = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.9, 0.9, 0.9),
+        base_color_texture: Some(images.add(grain)),
+        normal_map_texture: Some(images.add(bump)),
         perceptual_roughness: 1.0,
         ..default()
     });
@@ -1299,7 +1350,7 @@ pub fn setup_scene(
         MeshMaterial3d(floor),
         Transform::default(),
     ));
-    spawn_bike(&mut commands, &mut meshes, &mut materials);
+    spawn_bike(&mut commands, &mut meshes, &mut bindposes, &mut materials);
 }
 
 fn mat(
@@ -1360,6 +1411,8 @@ fn floor_mesh() -> Mesh {
     let h = |i: usize, j: usize| terrain_height(xs[i], zs[j]);
     let mut pos = Vec::with_capacity(nx * nz);
     let mut nor = Vec::with_capacity(nx * nz);
+    let mut uv = Vec::with_capacity(nx * nz);
+    let mut tan: Vec<[f32; 4]> = Vec::with_capacity(nx * nz);
     for j in 0..nz {
         for i in 0..nx {
             let (i0, i1) = (i.saturating_sub(1), (i + 1).min(nx - 1));
@@ -1368,6 +1421,10 @@ fn floor_mesh() -> Mesh {
             let dz = (h(i, j1) - h(i, j0)) / (zs[j1] - zs[j0]);
             pos.push([xs[i], h(i, j), zs[j]]);
             nor.push(Vec3::new(-dx, 1.0, -dz).normalize().to_array());
+            // World-space UVs (one repeat per `TILE` metres) with +u along +x; the tangent follows
+            // the slope, and v runs along +z (hence the -1 handedness).
+            uv.push([xs[i] / surface::TILE, zs[j] / surface::TILE]);
+            tan.push(Vec3::new(1.0, dx, 0.0).normalize().extend(-1.0).to_array());
         }
     }
     let mut idx = Vec::with_capacity((nx - 1) * (nz - 1) * 6);
@@ -1384,6 +1441,8 @@ fn floor_mesh() -> Mesh {
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nor)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uv)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, tan)
     .with_inserted_indices(Indices::U32(idx))
 }
 
@@ -1512,7 +1571,12 @@ impl Build<'_, '_, '_> {
     }
 }
 
-fn spawn_bike(c: &mut Commands, meshes: &mut Assets<Mesh>, mats: &mut Assets<StandardMaterial>) {
+fn spawn_bike(
+    c: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    mats: &mut Assets<StandardMaterial>,
+) {
     let k = Kit {
         cube: meshes.add(cube(1.0, 1.0, 1.0)),
         cyl: meshes.add(cyl(1.0, 1.0, 14)),
@@ -1719,7 +1783,7 @@ fn spawn_bike(c: &mut Commands, meshes: &mut Assets<Mesh>, mats: &mut Assets<Sta
 
     spawn_wheel(&mut b, &k, &tire, &rim, false);
     b.parent = root;
-    spawn_rider(&mut b, &k);
+    spawn_rider(&mut b, &k, meshes, bindposes);
 }
 
 /// Tire, rim, hub, spokes, rotor (and cassette on the rear). Everything spins with the `Wheel` node.
@@ -1806,7 +1870,12 @@ fn spawn_wheel(b: &mut Build, k: &Kit, tire: &Handle<Mesh>, rim: &Handle<Mesh>, 
     }
 }
 
-fn spawn_rider(root: &mut Build, k: &Kit) {
+fn spawn_rider(
+    root: &mut Build,
+    k: &Kit,
+    meshes: &mut Assets<Mesh>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+) {
     let rider = root
         .c
         .spawn((
@@ -1820,51 +1889,27 @@ fn spawn_rider(root: &mut Build, k: &Kit) {
         c: &mut *root.c,
         parent: rider,
     };
-    let (cyl, ball, cube) = (&k.cyl, &k.ball, &k.cube);
-    b.at(ball, &k.shorts, P::Hip, Vec3::new(0.27, 0.17, 0.23));
-    b.link(cyl, &k.jersey, P::Hip, P::Waist, 0.30, 0.20);
-    b.link(cyl, &k.jersey, P::Waist, P::Shoulder, 0.34, 0.21);
-    b.link(cyl, &k.jersey, P::ShoulderL, P::ShoulderR, 0.09, 0.09);
-    b.link(cyl, &k.skin, P::Shoulder, P::Head, 0.075, 0.075);
-
-    let limbs = [
-        // hip, knee, ankle, heel, toe, shoulder, elbow, wrist, grip
-        (
-            P::HipL,
-            P::KneeL,
-            P::AnkleL,
-            P::HeelL,
-            P::ToeL,
-            P::ShoulderL,
-            P::ElbowL,
-            P::WristL,
-            P::HandL,
-        ),
-        (
-            P::HipR,
-            P::KneeR,
-            P::AnkleR,
-            P::HeelR,
-            P::ToeR,
-            P::ShoulderR,
-            P::ElbowR,
-            P::WristR,
-            P::HandR,
-        ),
-    ];
-    for (hip, knee, ankle, heel, toe, shoulder, elbow, wrist, grip) in limbs {
-        b.at(ball, &k.shorts, hip, Vec3::splat(0.13));
-        b.link(cyl, &k.shorts, hip, knee, 0.115, 0.115);
-        b.at(ball, &k.shorts, knee, Vec3::splat(0.115));
-        b.link(cyl, &k.shorts, knee, ankle, 0.088, 0.088);
-        b.link(cube, &k.shoe, heel, toe, 0.09, 0.075);
-
-        b.at(ball, &k.jersey, shoulder, Vec3::splat(0.105));
-        b.link(cyl, &k.jersey, shoulder, elbow, 0.085, 0.085);
-        b.at(ball, &k.jersey, elbow, Vec3::splat(0.08));
-        b.link(cyl, &k.jersey, elbow, wrist, 0.068, 0.068);
-        b.at(ball, &k.shorts, grip, Vec3::new(0.085, 0.06, 0.075)); // glove wrapped on the grip
-    }
+    let (ball, cube) = (&k.ball, &k.cube);
+    body::spawn(
+        b.c,
+        meshes,
+        bindposes,
+        rider,
+        body::Style {
+            sole: ANKLE_OFF.y - HEEL_OFF.y,
+            heel: HEEL_OFF.z - ANKLE_OFF.z,
+            toe: ANKLE_OFF.z - TOE_OFF.z,
+            cuff: 0.0,
+        },
+        [
+            k.jersey.clone(),
+            k.shorts.clone(),
+            k.skin.clone(),
+            k.shoe.clone(),
+            k.shorts.clone(),
+        ],
+        RiderJoint,
+    );
 
     // Head: skull, goggles, helmet with coral stripe and visor; tilts with the torso.
     let head = b.node(Part::Head);
@@ -1873,7 +1918,6 @@ fn spawn_rider(root: &mut Build, k: &Kit) {
         parent: head,
     };
     let id = Quat::IDENTITY;
-    h.solid(ball, &k.skin, Vec3::ZERO, id, Vec3::new(0.165, 0.21, 0.20));
     h.solid(
         ball,
         &k.helmet,

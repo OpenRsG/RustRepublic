@@ -26,7 +26,8 @@ bevy = { version = "=0.17.3", optional = true, default-features = false, feature
     "bevy_core_pipeline", "bevy_pbr", "bevy_render", "bevy_image", "bevy_mesh",
     "bevy_camera", "bevy_light", "bevy_shader", "bevy_text", "bevy_ui",
     "bevy_ui_render", "bevy_window", "bevy_winit", "bevy_log", "default_font",
-    "bevy_gizmos", "tonemapping_luts", "ktx2", "zstd_rust",
+    "bevy_gizmos", "tonemapping_luts", "ktx2", "zstd_rust", "bevy_anti_alias", "smaa_luts",
+    "bevy_post_process",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
