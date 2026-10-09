@@ -398,4 +398,62 @@ mod tests {
         assert_eq!(demo.index, 0);
         assert!(bike.crash.is_none());
     }
+
+    /// Every crash run, with the rider detached as in the game: the rider stays near the wreck,
+    /// never explodes, and is asleep within a few seconds.
+    #[test]
+    fn showcase_crashes_settle_the_rider_asleep() {
+        use crate::ragdoll::{Ragdoll, index};
+        let dt = 1.0 / 120.0;
+        for (i, run) in RUNS.iter().enumerate().filter(|(_, r)| r.expect_crash) {
+            let mut bike = Bike::default();
+            bike.select_discipline(Discipline::Freeride);
+            let mut demo = Showcase {
+                enabled: true,
+                index: i,
+                ..default()
+            };
+            let (mut anim, mut ragdoll) = (AnimationState::default(), Ragdoll::default());
+            demo.begin_run(&mut bike);
+            let mut crashed_at = None;
+            for tick in 0..(60.0 / dt) as usize {
+                let mut c = Controls::default();
+                if bike.crash.is_none() {
+                    demo.drive(&mut bike, &mut c, dt);
+                    anim.update(&Input::from_bike(&bike, &c), dt);
+                }
+                bike.collision_pose = scene::collision_pose(&bike, &anim);
+                let seed = bike
+                    .crash
+                    .is_none()
+                    .then(|| ragdoll.sample(&bike, scene::rider_points(&bike, &anim), dt));
+                bike.step(&c, dt);
+                if bike.crash.is_some() {
+                    if let Some(seed) = seed {
+                        ragdoll.activate(seed);
+                        crashed_at = Some(tick);
+                    }
+                    ragdoll.step(&mut bike, dt);
+                    let body = ragdoll.body.as_ref().unwrap();
+                    let hip = body.positions[index(scene::P::Hip)];
+                    assert!(
+                        hip.is_finite() && hip.distance(bike.position) < 40.0,
+                        "{}: rider at {hip}, wreck at {}",
+                        run.name,
+                        bike.position
+                    );
+                    if body.sleeping {
+                        let took = (tick - crashed_at.unwrap()) as f32 * dt;
+                        assert!(took < 6.0, "{}: rider took {took} s to settle", run.name);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                ragdoll.body.as_ref().is_some_and(|b| b.sleeping),
+                "{}: rider never settled",
+                run.name
+            );
+        }
+    }
 }

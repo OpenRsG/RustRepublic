@@ -16,8 +16,8 @@
 //! and the lean turns it (countersteer first); the front wheel angle is read back from the turn.
 //! A landing is judged on touchdown against the surface (attitude, slip, spin, closing speed, grip
 //! support); a failed landing, or any rider/frame proxy striking the floor while riding, is a
-//! crash: the bike alone (wheels and frame proxies) then tumbles under gravity and friction until
-//! reset, while the detached rider is simulated separately (`ragdoll`).
+//! crash: the bike (wheels and frame proxies) then tumbles under gravity and friction until reset,
+//! while the detached rider is a rigid-body ragdoll (`ragdoll`) that pushes and pulls the wreck.
 
 use bevy::prelude::{Quat, Resource, Vec2, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -40,7 +40,10 @@ const MAX_FRAME_DT: f32 = 1.0 / 15.0;
 const STOP_START: f32 = 0.14;
 const STOP_K: f32 = 600.0;
 const MAX_WHEEL_FORCE: f32 = 60.0;
-const GYRATION_SQ: f32 = 0.2;
+/// Squared radius of gyration, m^2: the inertia is `CRASH_MASS * GYRATION_SQ` about any axis.
+pub const GYRATION_SQ: f32 = 0.2;
+/// Mass of the crashed bike, kg: what the detached rider presses on and pulls at.
+pub const CRASH_MASS: f32 = 14.0;
 // Tyre friction coefficient: the force a wheel can transmit, longitudinal (drive/brake) and lateral
 // (cornering, slip removal) together, is at most this times its strut load, so a wheel that unloads
 // fades out smoothly instead of switching.
@@ -124,8 +127,8 @@ const JUMP_RISE: f32 = 7.0;
 const JUMP_FALL: f32 = 9.0;
 const JUMP_ROUND: f32 = 0.8;
 
-// Tyre torus: the contact reach of a tilted wheel shrinks from WHEEL_RADIUS to this tube radius.
-const TIRE_TUBE: f32 = 0.05;
+// Tyre torus: the contact reach of a tilted wheel shrinks from WHEEL_RADIUS to this tube radius, m.
+pub const TIRE_TUBE: f32 = 0.05;
 
 // Full rotations. `Controls.flip` raises air pitch/roll authority and releases rate damping.
 // Without it, damping fades out beyond `ASSIST_TILT`; there is no target-attitude torque.
@@ -713,6 +716,21 @@ impl Bike {
 
     pub fn orientation(&self) -> Quat {
         self.rot
+    }
+
+    /// Angular velocity in the world frame, rad/s.
+    pub fn world_omega(&self) -> Vec3 {
+        self.rot * self.angular_velocity()
+    }
+
+    /// What the detached rider did to the crashed bike over a step: moved it by `dx`, turned it by
+    /// the world rotation `dq`, and left it moving at `velocity` and spinning at `omega` (world).
+    pub fn push(&mut self, dx: Vec3, dq: Quat, velocity: Vec3, omega: Vec3) {
+        self.position += dx;
+        self.rot = (dq * self.rot).normalize();
+        self.velocity = velocity;
+        self.set_angular_velocity(self.rot.inverse() * omega);
+        self.sync_attitude();
     }
 
     fn angular_velocity(&self) -> Vec3 {

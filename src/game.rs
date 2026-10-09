@@ -642,7 +642,7 @@ fn simulate(
         if let Some(seed) = seed {
             ragdoll.activate(seed);
         }
-        ragdoll.step(&bike, dt);
+        ragdoll.step(&mut bike, dt);
         if !showcase.enabled {
             stand_up(&mut bike, &mut animation, &mut ragdoll);
         }

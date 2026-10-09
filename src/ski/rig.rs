@@ -10,6 +10,7 @@ use super::physics::{Grab, STROKE_PUSH, Skier, skate_stroke, stroke_time};
 use super::pose::*;
 use super::ragdoll::boot_in_ankle_range;
 use crate::bike::terrain_height;
+use crate::rigid::closest_params;
 use bevy::prelude::*;
 use std::f32::consts::{PI, TAU};
 
@@ -336,38 +337,6 @@ fn body_volumes(p: &SkierPose) -> [Capsule; BODY_VOLUMES] {
         r4,
         r5,
     ]
-}
-
-/// Parameters `(s, t)` of the closest points between segments `p0`-`p1` and `q0`-`q1`.
-pub(crate) fn closest_params(p0: Vec3, p1: Vec3, q0: Vec3, q1: Vec3) -> (f32, f32) {
-    let (d1, d2, r) = (p1 - p0, q1 - q0, p0 - q0);
-    let (a, e, f) = (d1.length_squared(), d2.length_squared(), d2.dot(r));
-    if a < 1e-9 && e < 1e-9 {
-        return (0.0, 0.0);
-    }
-    if a < 1e-9 {
-        return (0.0, (f / e).clamp(0.0, 1.0));
-    }
-    let c = d1.dot(r);
-    if e < 1e-9 {
-        return ((-c / a).clamp(0.0, 1.0), 0.0);
-    }
-    let b = d1.dot(d2);
-    let den = a * e - b * b;
-    let mut s = if den > 1e-9 {
-        ((b * f - c * e) / den).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let mut t = (b * s + f) / e;
-    if t < 0.0 {
-        t = 0.0;
-        s = (-c / a).clamp(0.0, 1.0);
-    } else if t > 1.0 {
-        t = 1.0;
-        s = ((b - c) / a).clamp(0.0, 1.0);
-    }
-    (s, t)
 }
 
 /// Gap between capsule `c` and segment `a`-`b` of radius `r` (negative = overlap), with the

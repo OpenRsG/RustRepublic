@@ -1,33 +1,50 @@
-//! Detached rider: mass-weighted position constraints, bounded joints and capsule terrain contact.
+//! Detached rider: fifteen rigid capsule segments (`crate::rigid`) pinned at the skeleton's joints
+//! with anatomical swing/twist limits, colliding with each other, the terrain and the crashed bike.
+//! The bike is a body of the same solver, so hands and feet holding it, and every contact between
+//! rider and bike, push the bike as hard as the bike pushes the rider.
 use bevy::prelude::*;
 
-use crate::bike::{Bike, WHEEL_RADIUS, terrain_height};
-use crate::scene::{P, SKELETON};
+use crate::bike::{Bike, CRASH_MASS, CollisionPose, GYRATION_SQ, TIRE_TUBE, WHEEL_RADIUS};
+use crate::rigid::*;
+use crate::scene::P;
 
 pub(crate) const COUNT: usize = P::N as usize - P::Hip as usize;
 pub(crate) const fn index(p: P) -> usize {
     p as usize - P::Hip as usize
 }
 
-#[derive(Clone, Copy, Default)]
-struct Constraint {
-    a: usize,
-    b: usize,
-    min: f32,
-    max: f32,
-}
+/// The rider's rig points in `index` order.
+const RIDER: [P; COUNT] = [
+    P::Hip,
+    P::HipL,
+    P::HipR,
+    P::KneeL,
+    P::KneeR,
+    P::AnkleL,
+    P::AnkleR,
+    P::HeelL,
+    P::HeelR,
+    P::ToeL,
+    P::ToeR,
+    P::Waist,
+    P::Shoulder,
+    P::ShoulderL,
+    P::ShoulderR,
+    P::ElbowL,
+    P::ElbowR,
+    P::WristL,
+    P::WristR,
+    P::Neck,
+    P::Head,
+    P::HandL,
+    P::HandR,
+];
 
-/// Rider mass, kg; shared out over the particles in proportion to `1 / inverse_mass`.
-const RIDER_MASS: f32 = 80.0;
 /// Pull a hand can hold against before the fingers open, N: a sustained pull of a few hundred N
 /// on a bar the fingers hook around.
 const HAND_GRIP_FORCE: f32 = 600.0;
 /// Pull a foot can hold against on a flat pedal (pins and friction only), N.
 const FOOT_GRIP_FORCE: f32 = 200.0;
-/// A grip whose demanded force stays above its strength for this long lets go for good, s.
-const GRIP_RELEASE_TIME: f32 = 0.02;
-/// Time over which a held point closes its remaining distance to the grip, s.
-const GRIP_CLOSE_TIME: f32 = 0.05;
 /// Wrists and ankles with the strength each can hold.
 const GRIPS: [(P, f32); 4] = [
     (P::WristL, HAND_GRIP_FORCE),
@@ -35,18 +52,225 @@ const GRIPS: [(P, f32); 4] = [
     (P::AnkleL, FOOT_GRIP_FORCE),
     (P::AnkleR, FOOT_GRIP_FORCE),
 ];
+/// Limb speed relative to the bike beyond which the animation's pose difference is a glitch, m/s.
+const MAX_LIMB_SPEED: f32 = 12.0;
+/// The same for a segment's spin, rad/s.
+const MAX_LIMB_SPIN: f32 = 25.0;
+/// Lumbar and thoracic spine as one joint (the rig has one waist point): forward bend is negative
+/// flex, a right side-bend negative side, a right turn negative twist.
+const SPINE: Limit = ball(
+    [-85.0, 40.0],
+    [-45.0, 45.0],
+    [-47.0, 47.0],
+    [600.0, 600.0, 300.0],
+);
+/// Ankle in a riding shoe: free flex both ways, some side play; the shoe breaks it like a boot does.
+const SHOE_ANKLE: Limit = hinged(
+    [-40.0, 40.0],
+    [-20.0, 20.0],
+    [-25.0, 25.0],
+    [500.0, 375.0, 190.0],
+);
 
-/// A wrist or ankle still held to the bike at `anchor` (bike frame).
-#[derive(Clone, Copy, Default)]
-struct Grip {
-    point: usize,
-    anchor: Vec3,
-    strength: f32,
-    held: bool,
-    /// Time the demanded force has recently exceeded `strength`, s.
-    strain: f32,
-    /// Impulse applied this substep, N s.
-    impulse: Vec3,
+/// Segments of the rider's body followed by the bike. Each has an anatomical frame: X right, Y up,
+/// Z back when standing with the arms hanging; Y runs along the segment.
+#[derive(Clone, Copy)]
+enum S {
+    Pelvis,
+    Chest,
+    Head,
+    UpperArmL,
+    UpperArmR,
+    ForearmL,
+    ForearmR,
+    HandL,
+    HandR,
+    ThighL,
+    ThighR,
+    ShinL,
+    ShinR,
+    FootL,
+    FootR,
+    Bike,
+}
+
+impl From<S> for usize {
+    fn from(s: S) -> usize {
+        s as usize
+    }
+}
+
+/// Segments of the rider alone.
+const LIMBS: usize = S::Bike as usize;
+const BIKE: usize = S::Bike as usize;
+
+/// The segment a rig point is rigidly fixed to.
+fn owner(p: P) -> S {
+    match p {
+        P::Hip | P::HipL | P::HipR => S::Pelvis,
+        P::Waist | P::Shoulder => S::Chest,
+        P::Neck | P::Head => S::Head,
+        P::ShoulderL => S::UpperArmL,
+        P::ShoulderR => S::UpperArmR,
+        P::ElbowL => S::ForearmL,
+        P::ElbowR => S::ForearmR,
+        P::WristL | P::HandL => S::HandL,
+        P::WristR | P::HandR => S::HandR,
+        P::KneeL => S::ShinL,
+        P::KneeR => S::ShinR,
+        P::AnkleL | P::HeelL | P::ToeL => S::FootL,
+        P::AnkleR | P::HeelR | P::ToeR => S::FootR,
+        _ => unreachable!("not a rider point"),
+    }
+}
+
+fn side_of(i: usize, l: S, r: S) -> S {
+    if i == 0 { l } else { r }
+}
+
+/// Mass elements (kg, 80 kg of rider with helmet and shoes) and collision capsules, sized like the
+/// rendered rider, from rig points in `at`.
+fn parts(at: impl Fn(P) -> Vec3) -> Vec<Part> {
+    let slab = |body: S, a: P, b: P, across: Vec3, dx: f32, dz: f32, mass: f32| {
+        let (a, b) = (at(a), at(b));
+        let x = unit(across.reject_from(b - a)) * (0.5 * (dx - dz));
+        [
+            part(body, a - x, b - x, 0.5 * dz, mass * 0.5),
+            part(body, a + x, b + x, 0.5 * dz, mass * 0.5),
+        ]
+    };
+    let mut out = Vec::new();
+    let hips = at(P::HipR) - at(P::HipL);
+    let shoulders = at(P::ShoulderR) - at(P::ShoulderL);
+    out.extend(slab(S::Pelvis, P::Hip, P::Waist, hips, 0.30, 0.21, 9.5));
+    out.extend(slab(
+        S::Chest,
+        P::Waist,
+        P::Neck,
+        shoulders,
+        0.38,
+        0.22,
+        26.0,
+    ));
+    out.push(part(S::Head, at(P::Head), at(P::Head), 0.12, 5.4));
+    out.push(part(S::Head, at(P::Neck), at(P::Head), 0.05, 1.1));
+    for i in 0..2 {
+        let pick = |l: P, r: P| at(if i == 0 { l } else { r });
+        let [hip, knee, ankle, heel, toe] = [
+            pick(P::HipL, P::HipR),
+            pick(P::KneeL, P::KneeR),
+            pick(P::AnkleL, P::AnkleR),
+            pick(P::HeelL, P::HeelR),
+            pick(P::ToeL, P::ToeR),
+        ];
+        let [shoulder, elbow, wrist, hand] = [
+            pick(P::ShoulderL, P::ShoulderR),
+            pick(P::ElbowL, P::ElbowR),
+            pick(P::WristL, P::WristR),
+            pick(P::HandL, P::HandR),
+        ];
+        // The upper arm collides from below the shoulder, which sits inside the chest slab.
+        let upper = side_of(i, S::UpperArmL, S::UpperArmR);
+        out.push(Part {
+            collide: false,
+            ..part(upper, shoulder, elbow, 0.05, 2.6)
+        });
+        out.push(part(upper, shoulder.lerp(elbow, 0.45), elbow, 0.05, 0.0));
+        out.push(part(
+            side_of(i, S::ForearmL, S::ForearmR),
+            elbow,
+            wrist,
+            0.04,
+            1.5,
+        ));
+        out.push(part(
+            side_of(i, S::HandL, S::HandR),
+            wrist,
+            hand,
+            0.045,
+            0.5,
+        ));
+        out.push(part(
+            side_of(i, S::ThighL, S::ThighR),
+            hip,
+            knee,
+            0.075,
+            9.0,
+        ));
+        out.push(part(
+            side_of(i, S::ShinL, S::ShinR),
+            knee,
+            ankle,
+            0.055,
+            4.2,
+        ));
+        out.push(part(side_of(i, S::FootL, S::FootR), heel, toe, 0.045, 1.5));
+    }
+    out
+}
+
+/// Anatomical frame of each of the rider's segments, from rig points in `at`.
+fn frames(at: impl Fn(P) -> Vec3) -> Vec<Quat> {
+    let mut f = vec![Quat::IDENTITY; LIMBS];
+    let pelvis = basis(at(P::HipR) - at(P::HipL), at(P::Waist) - at(P::Hip));
+    let chest = basis(
+        at(P::ShoulderR) - at(P::ShoulderL),
+        at(P::Neck) - at(P::Waist),
+    );
+    f[S::Pelvis as usize] = pelvis;
+    f[S::Chest as usize] = chest;
+    f[S::Head as usize] = basis(chest * Vec3::X, at(P::Head) - at(P::Neck));
+    for i in 0..2 {
+        let pick = |l: P, r: P| at(if i == 0 { l } else { r });
+        let [hip, knee, ankle, heel, toe] = [
+            pick(P::HipL, P::HipR),
+            pick(P::KneeL, P::KneeR),
+            pick(P::AnkleL, P::AnkleR),
+            pick(P::HeelL, P::HeelR),
+            pick(P::ToeL, P::ToeR),
+        ];
+        let [shoulder, elbow, wrist, hand] = [
+            pick(P::ShoulderL, P::ShoulderR),
+            pick(P::ElbowL, P::ElbowR),
+            pick(P::WristL, P::WristR),
+            pick(P::HandL, P::HandR),
+        ];
+        let mut set = |l: S, r: S, q: Quat| f[side_of(i, l, r) as usize] = q;
+        // Knees bend backwards: their flexion axis is the elbow's with root and end swapped.
+        let knee_x = hinge(ankle, knee, hip, pelvis * Vec3::X);
+        set(S::ThighL, S::ThighR, basis(knee_x, hip - knee));
+        set(S::ShinL, S::ShinR, basis(knee_x, knee - ankle));
+        set(
+            S::FootL,
+            S::FootR,
+            basis(knee_x, (heel - toe).cross(knee_x)),
+        );
+        let elbow_x = hinge(shoulder, elbow, wrist, chest * Vec3::X);
+        set(S::UpperArmL, S::UpperArmR, basis(elbow_x, shoulder - elbow));
+        set(S::ForearmL, S::ForearmR, basis(elbow_x, elbow - wrist));
+        set(S::HandL, S::HandR, basis(elbow_x, wrist - hand));
+    }
+    f
+}
+
+/// The bike's collision capsules, bike-local: the frame proxies, and each tyre as a ring of chords.
+fn bike_shapes(pose: &CollisionPose) -> Vec<(Vec3, Vec3, f32)> {
+    const CHORDS: usize = 8;
+    let mut out: Vec<_> = (pose.bodies.iter().filter(|b| !b.rider))
+        .map(|b| (b.offset, b.offset, b.radius))
+        .collect();
+    for (hub, axle) in pose.wheel_rest.into_iter().zip(pose.wheel_axes) {
+        let (u, v) = (
+            axle.any_orthonormal_vector(),
+            axle.cross(axle.any_orthonormal_vector()),
+        );
+        let ring = |k: usize| {
+            let a = k as f32 / CHORDS as f32 * std::f32::consts::TAU;
+            hub + (u * a.cos() + v * a.sin()) * (WHEEL_RADIUS - TIRE_TUBE)
+        };
+        out.extend((0..CHORDS).map(|k| (ring(k), ring(k + 1), TIRE_TUBE)));
+    }
+    out
 }
 
 #[derive(Resource, Default)]
@@ -55,25 +279,29 @@ pub(crate) struct Ragdoll {
     previous: Option<[Vec3; COUNT]>,
 }
 
+/// The rider and bike at the instant before the bike resolved its impact.
 pub(crate) struct Seed {
     pub positions: [Vec3; COUNT],
-    velocities: [Vec3; COUNT],
-    /// Bike-frame position of each of `GRIPS` the rider still holds at the crash.
-    grips: [Option<Vec3>; 4],
+    /// Rig points in the bike's frame now and one step earlier, and the step, s.
+    local: [Vec3; COUNT],
+    previous: Option<[Vec3; COUNT]>,
+    dt: f32,
+    pose: CollisionPose,
+    bike: (Vec3, Quat),
+    velocity: Vec3,
+    omega: Vec3,
 }
 
 pub(crate) struct Body {
     pub positions: [Vec3; COUNT],
-    velocities: [Vec3; COUNT],
-    constraints: [Constraint; 48],
-    constraint_count: usize,
-    radii: [f32; COUNT],
-    inverse_mass: [f32; COUNT],
-    /// Kilograms per unit of `1 / inverse_mass`.
-    mass_unit: f32,
-    grips: [Grip; 4],
     pub sleeping: bool,
-    quiet_time: f32,
+    solver: Solver,
+    /// Owner segment and local position of every rig point.
+    points: [(usize, Vec3); COUNT],
+    /// Joint holding each of `GRIPS` to the bike, if the rider held it at the crash.
+    grips: [Option<usize>; 4],
+    /// Where the bike stood when the last step ended, which is where this step's bike body starts.
+    bike: (Vec3, Quat),
 }
 
 impl Ragdoll {
@@ -85,40 +313,33 @@ impl Ragdoll {
     /// Capture BEFORE the bike resolves its impact, preserving rider momentum and limb motion.
     pub fn sample(&mut self, bike: &Bike, local: [Vec3; COUNT], dt: f32) -> Seed {
         let q = bike.orientation();
-        let omega = q * Vec3::new(bike.pitch_rate, bike.yaw_rate, bike.roll_rate);
-        let positions = local.map(|p| bike.position + q * p);
-        let velocities = std::array::from_fn(|i| {
-            let limb = self.previous.as_ref().map_or(Vec3::ZERO, |old| {
-                ((local[i] - old[i]) / dt).clamp_length_max(12.0)
-            });
-            bike.velocity + omega.cross(q * local[i]) + q * limb
-        });
+        let seed = Seed {
+            positions: local.map(|p| bike.position + q * p),
+            local,
+            previous: self.previous,
+            dt,
+            pose: bike.collision_pose,
+            bike: (bike.position, q),
+            velocity: bike.velocity,
+            omega: bike.world_omega(),
+        };
         self.previous = Some(local);
-        let pose = &bike.collision_pose;
-        let release = [
-            pose.hand_release[0],
-            pose.hand_release[1],
-            pose.foot_release[0],
-            pose.foot_release[1],
-        ];
-        Seed {
-            positions,
-            velocities,
-            grips: std::array::from_fn(|k| (release[k] < 0.5).then(|| local[index(GRIPS[k].0)])),
-        }
+        seed
     }
 
     /// Which hands and feet have let go of the bike: `([left, right], [left, right])`.
     pub fn let_go(&self) -> Option<([bool; 2], [bool; 2])> {
-        let g = &self.body.as_ref()?.grips;
-        Some(([!g[0].held, !g[1].held], [!g[2].held, !g[3].held]))
+        let b = self.body.as_ref()?;
+        let open = |k: usize| b.grips[k].is_none_or(|j| b.solver.joints[j].broken);
+        Some(([open(0), open(1)], [open(2), open(3)]))
     }
 
     pub fn activate(&mut self, seed: Seed) {
-        self.body = Some(Body::new(seed));
+        self.body = Some(Body::new(&seed));
     }
 
-    pub fn step(&mut self, bike: &Bike, dt: f32) {
+    /// Steps the rider over `dt`; whatever it did to the crashed bike is applied to `bike`.
+    pub fn step(&mut self, bike: &mut Bike, dt: f32) {
         if let Some(body) = &mut self.body {
             body.step(bike, dt);
         }
@@ -126,438 +347,224 @@ impl Ragdoll {
 }
 
 impl Body {
-    fn new(seed: Seed) -> Self {
-        let mut b = Self {
-            positions: seed.positions,
-            velocities: seed.velocities,
-            constraints: [Constraint::default(); 48],
-            constraint_count: 0,
-            radii: [0.055; COUNT],
-            inverse_mass: [1.0; COUNT],
-            mass_unit: 1.0,
-            grips: [Grip::default(); 4],
+    fn new(seed: &Seed) -> Self {
+        let world = |p: P| seed.positions[index(p)];
+        let mut parts = parts(world);
+        let mut frame = frames(world);
+        let mut com = centres(&parts, LIMBS);
+        let (x, q) = seed.bike;
+        let shapes = bike_shapes(&seed.pose);
+        for &(a, b, r) in &shapes {
+            parts.push(part(
+                S::Bike,
+                x + q * a,
+                x + q * b,
+                r,
+                CRASH_MASS / shapes.len() as f32,
+            ));
+        }
+        frame.push(q);
+        com.push(x);
+        let mut solver = Solver::new(&parts, &frame, &com);
+        let bike = &mut solver.bodies[BIKE];
+        bike.inv_inertia = Mat3::IDENTITY / (CRASH_MASS * GYRATION_SQ);
+        bike.driven = true;
+        let points = std::array::from_fn(|i| {
+            let k = owner(RIDER[i]) as usize;
+            (k, frame[k].inverse() * (world(RIDER[i]) - com[k]))
+        });
+
+        let mut join =
+            |parent: S, child: S, at: P, limit: Limit, left: bool, name: &'static str| {
+                let joint = Joint {
+                    limit: Some(limit),
+                    mirror: left,
+                    frame: limit.frame(left),
+                    name,
+                    ..solver.pin(parent as usize, child as usize, world(at))
+                };
+                solver.joints.push(joint);
+            };
+        join(S::Pelvis, S::Chest, P::Waist, SPINE, false, "back");
+        join(S::Chest, S::Head, P::Neck, NECK, false, "neck");
+        for i in 0..2 {
+            let s = |l: S, r: S| side_of(i, l, r);
+            let j = |l: P, r: P| if i == 0 { l } else { r };
+            let n = |l: &'static str, r: &'static str| if i == 0 { l } else { r };
+            let left = i == 0;
+            join(
+                S::Chest,
+                s(S::UpperArmL, S::UpperArmR),
+                j(P::ShoulderL, P::ShoulderR),
+                SHOULDER,
+                left,
+                n("left shoulder", "right shoulder"),
+            );
+            join(
+                s(S::UpperArmL, S::UpperArmR),
+                s(S::ForearmL, S::ForearmR),
+                j(P::ElbowL, P::ElbowR),
+                ELBOW,
+                left,
+                n("left elbow", "right elbow"),
+            );
+            join(
+                s(S::ForearmL, S::ForearmR),
+                s(S::HandL, S::HandR),
+                j(P::WristL, P::WristR),
+                WRIST,
+                left,
+                n("left wrist", "right wrist"),
+            );
+            join(
+                S::Pelvis,
+                s(S::ThighL, S::ThighR),
+                j(P::HipL, P::HipR),
+                HIP,
+                left,
+                n("left hip", "right hip"),
+            );
+            join(
+                s(S::ThighL, S::ThighR),
+                s(S::ShinL, S::ShinR),
+                j(P::KneeL, P::KneeR),
+                KNEE,
+                left,
+                n("left knee", "right knee"),
+            );
+            join(
+                s(S::ShinL, S::ShinR),
+                s(S::FootL, S::FootR),
+                j(P::AnkleL, P::AnkleR),
+                SHOE_ANKLE,
+                left,
+                n("left ankle", "right ankle"),
+            );
+        }
+        // Hands and feet still on the bar and pedals are pinned to the bike by a joint that lets
+        // go when the pull on it is more than the fingers or the shoe can hold.
+        let release = [
+            seed.pose.hand_release[0],
+            seed.pose.hand_release[1],
+            seed.pose.foot_release[0],
+            seed.pose.foot_release[1],
+        ];
+        let grips = std::array::from_fn(|k| {
+            (release[k] < 0.5).then(|| {
+                let (p, strength) = GRIPS[k];
+                let joint = Joint {
+                    detachable: true,
+                    grip: strength,
+                    name: "grip",
+                    ..solver.pin(BIKE, owner(p) as usize, world(p))
+                };
+                solver.joints.push(joint);
+                solver.joints.len() - 1
+            })
+        });
+        solver.collide_unjointed(&[]);
+
+        // Velocities: the bike's, plus each segment's motion relative to the bike over the last step.
+        let local = |p: P| seed.local[index(p)];
+        let (now_com, now_f) = (centres(&self::parts(local), LIMBS), frames(local));
+        let before = seed.previous.map(|old| {
+            let old = |p: P| old[index(p)];
+            (centres(&self::parts(old), LIMBS), frames(old))
+        });
+        for k in 0..LIMBS {
+            let (dv, dw) = before.as_ref().map_or((Vec3::ZERO, Vec3::ZERO), |(c, g)| {
+                let dq = now_f[k] * g[k].inverse();
+                let dq = if dq.w < 0.0 { -dq } else { dq };
+                (
+                    ((now_com[k] - c[k]) / seed.dt).clamp_length_max(MAX_LIMB_SPEED),
+                    (dq.to_scaled_axis() / seed.dt).clamp_length_max(MAX_LIMB_SPIN),
+                )
+            });
+            let b = &mut solver.bodies[k];
+            b.v = seed.velocity + seed.omega.cross(b.x - x) + q * dv;
+            b.w = seed.omega + q * dw;
+        }
+        for k in 0..solver.joints.len() {
+            solver.joints[k].allow = solver.excess(k) * 1.2 + DEG;
+        }
+        // The bike stays where it is while the seed overlaps are pushed out.
+        let (inv_mass, inv_inertia) = (
+            solver.bodies[BIKE].inv_mass,
+            solver.bodies[BIKE].inv_inertia,
+        );
+        solver.bodies[BIKE].inv_mass = 0.0;
+        solver.bodies[BIKE].inv_inertia = Mat3::ZERO;
+        solver.settle();
+        solver.bodies[BIKE].inv_mass = inv_mass;
+        solver.bodies[BIKE].inv_inertia = inv_inertia;
+
+        let mut body = Self {
+            positions: [Vec3::ZERO; COUNT],
             sleeping: false,
-            quiet_time: 0.0,
+            solver,
+            points,
+            grips,
+            bike: seed.bike,
         };
-        for p in [P::Hip, P::Waist, P::Shoulder] {
-            b.radii[index(p)] = 0.13;
-            b.inverse_mass[index(p)] = 0.15;
-        }
-        b.radii[index(P::Head)] = 0.14;
-        b.inverse_mass[index(P::Head)] = 0.3;
-        for p in [P::KneeL, P::KneeR, P::ElbowL, P::ElbowR] {
-            b.radii[index(p)] = 0.065;
-        }
-        for (bones, _) in SKELETON {
-            for &(a, c) in bones {
-                b.fixed(a, c);
-            }
-        }
-        // Pelvis, chest, feet and hands retain their shape; the spine and limbs remain articulated.
-        for (a, c) in [
-            (P::HipL, P::HipR),
-            (P::ShoulderL, P::ShoulderR),
-            (P::Waist, P::ShoulderL),
-            (P::Waist, P::ShoulderR),
-            (P::Neck, P::ShoulderL),
-            (P::Neck, P::ShoulderR),
-            (P::HeelL, P::ToeL),
-            (P::HeelR, P::ToeR),
-        ] {
-            b.fixed(a, c);
-        }
-        for (a, joint, c) in [
-            (P::HipL, P::KneeL, P::AnkleL),
-            (P::HipR, P::KneeR, P::AnkleR),
-            (P::ShoulderL, P::ElbowL, P::WristL),
-            (P::ShoulderR, P::ElbowR, P::WristR),
-            (P::Hip, P::Waist, P::Shoulder),
-            (P::Shoulder, P::Neck, P::Head),
-        ] {
-            let upper = b.positions[index(a)].distance(b.positions[index(joint)]);
-            let lower = b.positions[index(c)].distance(b.positions[index(joint)]);
-            let min = if matches!(joint, P::Waist | P::Neck) {
-                (upper + lower) * 0.8
-            } else {
-                (upper - lower).abs().max((upper + lower) * 0.2)
-            };
-            b.add(a, c, min, upper + lower);
-        }
-        // Ball-joint cone limits keep arms/legs from folding through the torso, without pose motors.
-        for (a, c) in [
-            (P::Hip, P::KneeL),
-            (P::Hip, P::KneeR),
-            (P::Shoulder, P::ElbowL),
-            (P::Shoulder, P::ElbowR),
-        ] {
-            let rest = b.positions[index(a)].distance(b.positions[index(c)]);
-            b.add(a, c, rest * 0.55, rest * 1.35);
-        }
-        b.mass_unit = RIDER_MASS / b.inverse_mass.iter().map(|w| 1.0 / w).sum::<f32>();
-        for (k, (p, strength)) in GRIPS.into_iter().enumerate() {
-            b.grips[k] = Grip {
-                point: index(p),
-                anchor: seed.grips[k].unwrap_or_default(),
-                strength,
-                held: seed.grips[k].is_some(),
-                ..default()
-            };
-        }
-        b
+        body.refresh();
+        body
     }
 
-    fn add(&mut self, a: P, b: P, min: f32, max: f32) {
-        self.constraints[self.constraint_count] = Constraint {
-            a: index(a),
-            b: index(b),
-            min,
-            max,
-        };
-        self.constraint_count += 1;
-    }
-    fn fixed(&mut self, a: P, b: P) {
-        let length = self.positions[index(a)].distance(self.positions[index(b)]);
-        self.add(a, b, length, length);
+    fn refresh(&mut self) {
+        for (p, &(k, local)) in self.positions.iter_mut().zip(&self.points) {
+            *p = self.solver.bodies[k].point(local);
+        }
+        self.sleeping = self.solver.sleeping;
     }
 
-    fn step(&mut self, bike: &Bike, dt: f32) {
+    /// Steps over `dt` with the bike body carried from where it stood to where `bike` is now.
+    fn step(&mut self, bike: &mut Bike, dt: f32) {
         if self.sleeping || dt <= 0.0 {
             return;
         }
-        let speed = self
-            .velocities
-            .iter()
-            .map(|v| v.length())
-            .fold(0.0_f32, f32::max);
-        let count = (dt * 240.0)
-            .ceil()
-            .max((speed * dt / 0.04).ceil())
-            .clamp(1.0, 32.0) as usize;
-        let h = dt / count as f32;
-        for _ in 0..count {
-            self.substep(bike, h);
+        let (x0, q0) = self.bike;
+        let v = (bike.position - x0) / dt;
+        let turn = bike.orientation() * q0.inverse();
+        let w = (if turn.w < 0.0 { -turn } else { turn }).to_scaled_axis() / dt;
+        let b = &mut self.solver.bodies[BIKE];
+        (b.x, b.q, b.v, b.w) = (x0, q0, v, w);
+        self.solver.step(dt);
+        if !self.solver.sleeping {
+            let b = self.solver.bodies[BIKE];
+            let carried = Quat::from_scaled_axis(w * dt) * q0;
+            bike.push(
+                b.x - (x0 + v * dt),
+                b.q * carried.inverse(),
+                bike.velocity + b.v - v,
+                bike.world_omega() + b.w - w,
+            );
+            self.bike = (bike.position, bike.orientation());
         }
+        self.refresh();
     }
-
-    fn substep(&mut self, bike: &Bike, dt: f32) {
-        for i in 0..COUNT {
-            self.velocities[i].y -= 9.81 * dt;
-            self.velocities[i] *= (-0.2 * dt).exp();
-            self.positions[i] += self.velocities[i] * dt;
-        }
-        let incoming = self.velocities;
-        let mut normals = [Vec3::ZERO; COUNT];
-        let mut bike_normals = [Vec3::ZERO; COUNT];
-        let mut bike_velocities = [Vec3::ZERO; COUNT];
-        let bike_q = bike.orientation();
-        let bike_omega = bike_q * Vec3::new(bike.pitch_rate, bike.yaw_rate, bike.roll_rate);
-        for _ in 0..20 {
-            for k in 0..self.constraint_count {
-                let c = self.constraints[k];
-                let d = self.positions[c.b] - self.positions[c.a];
-                let length = d.length();
-                if length < 1e-6 {
-                    continue;
-                }
-                let correction = d * ((length - length.clamp(c.min, c.max)) / length);
-                let weight = self.inverse_mass[c.a] + self.inverse_mass[c.b];
-                self.positions[c.a] += correction * (self.inverse_mass[c.a] / weight);
-                self.positions[c.b] -= correction * (self.inverse_mass[c.b] / weight);
-            }
-            for i in 0..COUNT {
-                let (depth, n) = terrain_contact(self.positions[i], self.radii[i]);
-                if depth > 0.0 {
-                    self.positions[i] += n * depth;
-                    normals[i] = n;
-                }
-            }
-            // Capsule interiors also collide: long thighs/forearms cannot cut through a ramp.
-            for (bones, _) in SKELETON {
-                for &(a, b) in bones {
-                    let (a, b) = (index(a), index(b));
-                    let radius = self.radii[a].min(self.radii[b]);
-                    let samples =
-                        (self.positions[a].distance(self.positions[b]) / 0.07).ceil() as usize;
-                    for k in 1..samples {
-                        let t = k as f32 / samples as f32;
-                        let centre = self.positions[a].lerp(self.positions[b], t);
-                        let (depth, n) = terrain_contact(centre, radius);
-                        if depth <= 0.0 {
-                            continue;
-                        }
-                        let wa = self.inverse_mass[a] * (1.0 - t);
-                        let wb = self.inverse_mass[b] * t;
-                        let denom = wa * (1.0 - t) + wb * t;
-                        self.positions[a] += n * (depth * wa / denom);
-                        self.positions[b] += n * (depth * wb / denom);
-                        normals[a] = n;
-                        normals[b] = n;
-                    }
-                }
-            }
-            // Bike contacts act on the detached rider, never a hidden attachment to the saddle.
-            for i in 0..COUNT {
-                for shape in bike.collision_pose.bodies.iter().filter(|s| !s.rider) {
-                    let centre = bike.position + bike_q * shape.offset;
-                    if let Some(n) = self.separate(i, centre, shape.radius) {
-                        bike_normals[i] = n;
-                        bike_velocities[i] =
-                            bike.velocity + bike_omega.cross(centre - bike.position);
-                    }
-                }
-                for (k, hub) in bike.collision_pose.wheel_rest.iter().enumerate() {
-                    let centre = bike.position + bike_q * *hub;
-                    // Tire ring, not a solid wheel disk.
-                    let axle = bike_q * bike.collision_pose.wheel_axes[k];
-                    let d = self.positions[i] - centre;
-                    let radial = d - axle * d.dot(axle);
-                    let ring = centre + radial.normalize_or_zero() * (WHEEL_RADIUS - 0.05);
-                    if let Some(n) = self.separate(i, ring, 0.05) {
-                        bike_normals[i] = n;
-                        bike_velocities[i] = bike.velocity + bike_omega.cross(ring - bike.position);
-                    }
-                }
-                let (depth, n) = terrain_contact(self.positions[i], self.radii[i]);
-                if depth > 0.0 {
-                    self.positions[i] += n * depth;
-                    normals[i] = n;
-                }
-            }
-        }
-        // Split impulses: penetration repair must never become launch velocity. Solve joint and
-        // contact velocities separately; only real incoming momentum supplies restitution.
-        let mut normal_impulses = [0.0_f32; COUNT];
-        let mut directions = [Vec3::ZERO; 48];
-        let mut lengths = [0.0_f32; 48];
-        for (k, c) in self.constraints[..self.constraint_count].iter().enumerate() {
-            let d = self.positions[c.b] - self.positions[c.a];
-            lengths[k] = d.length();
-            directions[k] = d.normalize_or_zero();
-        }
-        // Passive joint friction removes limb oscillation without driving a rest pose or changing
-        // the centre-of-mass velocity.
-        let joint_damping = 1.0 - (-3.0 * dt).exp();
-        for c in &self.constraints[..self.constraint_count] {
-            if c.min != c.max {
-                continue;
-            }
-            let relative = self.velocities[c.b] - self.velocities[c.a];
-            let impulse =
-                relative * (joint_damping / (self.inverse_mass[c.a] + self.inverse_mass[c.b]));
-            self.velocities[c.a] += impulse * self.inverse_mass[c.a];
-            self.velocities[c.b] -= impulse * self.inverse_mass[c.b];
-        }
-        let grip_targets: [Vec3; 4] = std::array::from_fn(|k| {
-            let g = &self.grips[k];
-            let arm = bike_q * g.anchor;
-            bike.velocity
-                + bike_omega.cross(arm)
-                + (bike.position + arm - self.positions[g.point]) / GRIP_CLOSE_TIME
-        });
-        for g in &mut self.grips {
-            g.impulse = Vec3::ZERO;
-        }
-        let limit_scale = dt / self.mass_unit;
-        for _ in 0..100 {
-            let mut residual = 0.0_f32;
-            for (k, c) in self.constraints[..self.constraint_count].iter().enumerate() {
-                let length = lengths[k];
-                let n = directions[k];
-                let relative = (self.velocities[c.b] - self.velocities[c.a]).dot(n);
-                let constrained = c.min == c.max
-                    || (length <= c.min + 0.001 && relative < 0.0)
-                    || (length >= c.max - 0.001 && relative > 0.0);
-                if constrained {
-                    residual = residual.max(relative.abs());
-                    let impulse = relative / (self.inverse_mass[c.a] + self.inverse_mass[c.b]);
-                    self.velocities[c.a] += n * (impulse * self.inverse_mass[c.a]);
-                    self.velocities[c.b] -= n * (impulse * self.inverse_mass[c.b]);
-                }
-            }
-            // Force-limited grips: the accumulated impulse may not exceed strength * dt, so a bike
-            // that pulls harder than the fingers or pins can hold stops dragging the rider.
-            for (g, target) in self.grips.iter_mut().zip(grip_targets) {
-                if !g.held {
-                    continue;
-                }
-                let w = self.inverse_mass[g.point];
-                let wanted = (target - self.velocities[g.point]) / w;
-                let total = (g.impulse + wanted).clamp_length_max(g.strength * dt / self.mass_unit);
-                let applied = total - g.impulse;
-                g.impulse = total;
-                self.velocities[g.point] += applied * w;
-                residual = residual.max(applied.length() * w);
-            }
-            for i in 0..COUNT {
-                let n = normals[i];
-                if n != Vec3::ZERO {
-                    let vn = incoming[i].dot(n);
-                    let bounce = if vn < -1.0 { -vn * 0.12 } else { 0.0 };
-                    let impulse = (bounce - self.velocities[i].dot(n)).max(0.0);
-                    residual = residual.max(impulse);
-                    self.velocities[i] += n * impulse;
-                    normal_impulses[i] += impulse;
-                }
-                let n = bike_normals[i];
-                if n != Vec3::ZERO {
-                    let closing = (self.velocities[i] - bike_velocities[i]).dot(n);
-                    residual = residual.max((-closing).max(0.0));
-                    self.velocities[i] -= n * closing.min(0.0);
-                }
-            }
-            if residual < 1e-4 {
-                break;
-            }
-        }
-        for g in self.grips.iter_mut().filter(|g| g.held) {
-            let saturated = g.impulse.length() >= limit_scale * g.strength * 0.999;
-            g.strain = if saturated {
-                g.strain + dt
-            } else {
-                (g.strain - dt).max(0.0)
-            };
-            g.held = g.strain < GRIP_RELEASE_TIME;
-        }
-        for i in 0..COUNT {
-            let n = normals[i];
-            if n != Vec3::ZERO {
-                let normal = n * self.velocities[i].dot(n);
-                let tangent = self.velocities[i] - normal;
-                let speed = tangent.length();
-                self.velocities[i] = normal
-                    + tangent * (1.0 - (0.65 * normal_impulses[i] / speed.max(1e-6)).min(1.0));
-            }
-        }
-        let supported = normals.iter().any(|&n| n != Vec3::ZERO);
-        let quiet = self.velocities.iter().all(|v| v.length() < 0.12);
-        self.quiet_time = if supported && quiet {
-            self.quiet_time + dt
-        } else {
-            0.0
-        };
-        if self.quiet_time > 0.5 {
-            self.sleeping = true;
-            self.velocities.fill(Vec3::ZERO);
-        }
-    }
-
-    fn separate(&mut self, i: usize, centre: Vec3, radius: f32) -> Option<Vec3> {
-        let d = self.positions[i] - centre;
-        let reach = self.radii[i] + radius;
-        let length = d.length();
-        if length < reach {
-            let n = d.try_normalize().unwrap_or(Vec3::Y);
-            self.positions[i] = centre + n * reach;
-            Some(n)
-        } else {
-            None
-        }
-    }
-}
-
-fn terrain_contact(p: Vec3, radius: f32) -> (f32, Vec3) {
-    let eps = 0.05;
-    let dx = (terrain_height(p.x + eps, p.z) - terrain_height(p.x - eps, p.z)) / (2.0 * eps);
-    let dz = (terrain_height(p.x, p.z + eps) - terrain_height(p.x, p.z - eps)) / (2.0 * eps);
-    let n = Vec3::new(-dx, 1.0, -dz).normalize();
-    (radius - (p.y - terrain_height(p.x, p.z)) * n.y, n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::animation::AnimationState;
+    use crate::bike::{Controls, CrashReason, terrain_height};
+    use crate::scene::{SKELETON, collision_pose, rider_points};
 
-    #[test]
-    fn penetration_repair_does_not_launch_a_stationary_rider() {
-        let mut bike = Bike::default();
-        let local = crate::scene::rider_points(&bike, &AnimationState::default());
-        let positions = local
-            .map(|p| Vec3::new(20.0, 0.4, 8.0) + Quat::from_rotation_z(std::f32::consts::PI) * p);
-        let mut body = Body::new(Seed {
-            positions,
-            velocities: [Vec3::ZERO; COUNT],
-            grips: [None; 4],
-        });
-        bike.position.x = -50.0;
-        let dt = 1.0 / 120.0;
-        body.step(&bike, dt);
-        let energy = (0..COUNT)
-            .map(|i| body.velocities[i].length_squared() / body.inverse_mass[i])
-            .sum::<f32>();
-        let freefall_energy = body
-            .inverse_mass
-            .iter()
-            .map(|m| (9.81 * dt).powi(2) / m)
-            .sum::<f32>();
-        assert!(
-            energy <= freefall_energy * 1.01,
-            "penetration injected kinetic energy: {energy} > {freefall_energy}"
-        );
-        assert!(body.positions.iter().all(|p| p.is_finite()));
-    }
-
-    #[test]
-    fn crash_detaches_articulates_and_keeps_bones_above_ground() {
-        let mut bike = Bike::default();
-        bike.position += Vec3::new(20.0, 2.0, 0.0);
-        bike.velocity = Vec3::new(3.0, -5.0, -4.0);
-        bike.pitch_rate = 2.0;
-        let local = crate::scene::rider_points(&bike, &AnimationState::default());
-        let mut ragdoll = Ragdoll::default();
-        let seed = ragdoll.sample(&bike, local, 1.0 / 120.0);
-        let original = seed.positions;
-        ragdoll.activate(seed);
-        bike.position.x = -50.0; // The wreck has its own trajectory, not a rider parent constraint.
-        for _ in 0..1200 {
-            ragdoll.step(&bike, 1.0 / 120.0);
-        }
-        let body = ragdoll.body.as_ref().unwrap();
-        assert!(
-            body.positions[index(P::Hip)].distance(bike.position) > 20.0,
-            "rider must move independently of the wreck"
-        );
-        let before = original[index(P::KneeL)].distance(original[index(P::Shoulder)]);
-        let after = body.positions[index(P::KneeL)].distance(body.positions[index(P::Shoulder)]);
-        assert!(
-            (before - after).abs() > 0.05,
-            "pose must articulate, not rigidly tumble"
-        );
-        for c in &body.constraints[..body.constraint_count] {
-            let length = body.positions[c.a].distance(body.positions[c.b]);
-            assert!(
-                length >= c.min - 0.012 && length <= c.max + 0.012,
-                "joint length {length} outside {}..{}",
-                c.min,
-                c.max
-            );
-        }
-        for i in 0..COUNT {
-            assert!(body.positions[i].is_finite());
-            assert!(terrain_contact(body.positions[i], body.radii[i]).0 < 0.008);
-        }
-        assert!(
-            body.velocities.iter().all(|v| v.length() < 0.2),
-            "wreck must settle; joint velocities: {:?}",
-            body.velocities
-        );
-        ragdoll.reset();
-        assert!(ragdoll.body.is_none());
-    }
+    const DT: f32 = 1.0 / 120.0;
 
     /// Drives the bike and ragdoll like `game::simulate` until the bike crashes, then returns
     /// the wreck and rider.
     fn crash_from(mut bike: Bike, feet_off: bool) -> (Bike, Ragdoll) {
-        let dt = 1.0 / 120.0;
         let anim = AnimationState::default();
         let mut ragdoll = Ragdoll::default();
         for _ in 0..1200 {
-            bike.collision_pose = crate::scene::collision_pose(&bike, &anim);
+            bike.collision_pose = collision_pose(&bike, &anim);
             if feet_off {
                 bike.collision_pose.foot_release = [1.0; 2];
             }
-            let seed = ragdoll.sample(&bike, crate::scene::rider_points(&bike, &anim), dt);
-            bike.step(&crate::bike::Controls::default(), dt);
+            let seed = ragdoll.sample(&bike, rider_points(&bike, &anim), DT);
+            bike.step(&Controls::default(), DT);
             if bike.crash.is_some() {
                 ragdoll.activate(seed);
                 return (bike, ragdoll);
@@ -566,55 +573,131 @@ mod tests {
         panic!("bike never crashed");
     }
 
-    /// Metres from each wrist and ankle to its grip on the bike.
-    fn grip_gaps(bike: &Bike, body: &Body) -> [f32; 4] {
-        std::array::from_fn(|k| {
-            let g = &body.grips[k];
-            body.positions[g.point].distance(bike.position + bike.orientation() * g.anchor)
-        })
+    fn hard_crash() -> (Bike, Ragdoll) {
+        let mut bike = Bike::default();
+        bike.position.y += 40.0;
+        crash_from(bike, false)
+    }
+
+    fn held(body: &Body, k: usize) -> bool {
+        body.grips[k].is_some_and(|j| !body.solver.joints[j].broken)
+    }
+
+    /// Steps the wreck and the rider for `ticks`, asserting every tick that the rider stays finite
+    /// and above the terrain, that bones keep their length, and that no two limbs (5 mm) and no
+    /// limb and the bike (2 cm, a tyre's give) overlap.
+    fn run_checked(bike: &mut Bike, ragdoll: &mut Ragdoll, ticks: usize) {
+        let lengths = |p: &[Vec3; COUNT]| {
+            SKELETON
+                .iter()
+                .flat_map(|(bones, _)| bones.iter())
+                .map(|&(a, b)| p[index(a)].distance(p[index(b)]))
+                .collect::<Vec<_>>()
+        };
+        let rest = lengths(&ragdoll.body.as_ref().unwrap().positions);
+        for tick in 0..ticks {
+            bike.step(&Controls::default(), DT);
+            ragdoll.step(bike, DT);
+            let body = ragdoll.body.as_ref().unwrap();
+            for (i, p) in body.positions.iter().enumerate() {
+                assert!(p.is_finite(), "tick {tick}: point {i} not finite");
+                assert!(
+                    p.y >= terrain_height(p.x, p.z) - 0.01,
+                    "tick {tick}: point {i} sank to {p}"
+                );
+            }
+            for (now, was) in lengths(&body.positions).into_iter().zip(&rest) {
+                assert!(
+                    (now - was).abs() < 0.03,
+                    "tick {tick}: bone {was} stretched to {now}"
+                );
+            }
+            for (with_bike, limit) in [(false, -0.005), (true, -0.02)] {
+                let (gap, (a, b)) = body
+                    .solver
+                    .worst_overlap(|a, b| (a == BIKE || b == BIKE) != with_bike);
+                assert!(
+                    gap > limit,
+                    "tick {tick}: segments {a}/{b} overlap {gap} (limit {limit})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn penetration_repair_does_not_launch_a_stationary_rider() {
+        let mut bike = Bike::default();
+        bike.position.x = -50.0;
+        let local = rider_points(&bike, &AnimationState::default());
+        let mut ragdoll = Ragdoll::default();
+        let mut seed = ragdoll.sample(&bike, local, DT);
+        // The lowest point 10 cm under the terrain, nothing else moving.
+        let low = local.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        seed.positions = local.map(|p| Vec3::new(20.0, -0.1 - low, 8.0) + p);
+        (seed.velocity, seed.omega) = (Vec3::ZERO, Vec3::ZERO);
+        (seed.pose.hand_release, seed.pose.foot_release) = ([1.0; 2], [1.0; 2]);
+        ragdoll.activate(seed);
+        ragdoll.step(&mut bike, DT);
+        let body = ragdoll.body.as_ref().unwrap();
+        // Free fall for one tick gives -0.08 m/s; repairing the overlap must not throw anything up.
+        for b in &body.solver.bodies[..LIMBS] {
+            assert!(b.v.y < 0.3, "launched at {}", b.v);
+        }
+        assert!(body.positions.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn a_hard_crash_tumbles_intact_with_limbs_apart_and_settles_asleep() {
+        let (mut bike, mut ragdoll) = hard_crash();
+        let (crash, original) = (bike.position, ragdoll.body.as_ref().unwrap().positions);
+        run_checked(&mut bike, &mut ragdoll, 600);
+        let body = ragdoll.body.as_ref().unwrap();
+        assert!(body.sleeping, "still moving after 5 s");
+        let hip = body.positions[index(P::Hip)];
+        assert!(
+            hip.distance(crash) < 40.0,
+            "rider ended {hip}, crash at {crash}"
+        );
+        let knee_to_shoulder =
+            |p: &[Vec3; COUNT]| p[index(P::KneeL)].distance(p[index(P::Shoulder)]);
+        assert!(
+            (knee_to_shoulder(&original) - knee_to_shoulder(&body.positions)).abs() > 0.05,
+            "pose must articulate, not rigidly tumble"
+        );
+        ragdoll.reset();
+        assert!(ragdoll.body.is_none());
     }
 
     #[test]
     fn gentle_crashes_keep_the_hands_on_the_bars_hard_ones_lose_them() {
-        let dt = 1.0 / 120.0;
-        let controls = crate::bike::Controls::default();
+        let controls = Controls::default();
         let mut gentle = Bike::default();
         gentle.position.y += 0.15;
-        let mut hard = Bike::default();
-        hard.position.y += 40.0;
-        let ((mut gb, mut gr), (mut hb, mut hr)) =
-            (crash_from(gentle, true), crash_from(hard, false));
-        assert_eq!(
-            gb.crash.unwrap().reason,
-            crate::bike::CrashReason::MissingSupport
-        );
-        assert_ne!(
-            gb.crash.unwrap().reason,
-            crate::bike::CrashReason::HardImpact
-        );
-        assert_eq!(
-            hb.crash.unwrap().reason,
-            crate::bike::CrashReason::HardImpact
-        );
-        for _ in 0..(0.3 / dt) as usize {
-            gb.step(&controls, dt);
-            gr.step(&gb, dt);
+        let ((mut gb, mut gr), (mut hb, mut hr)) = (crash_from(gentle, true), hard_crash());
+        assert_eq!(gb.crash.unwrap().reason, CrashReason::MissingSupport);
+        assert_eq!(hb.crash.unwrap().reason, CrashReason::HardImpact);
+        for _ in 0..(0.3 / DT) as usize {
+            gb.step(&controls, DT);
+            gr.step(&mut gb, DT);
         }
-        for _ in 0..(0.1 / dt) as usize {
-            hb.step(&controls, dt);
-            hr.step(&hb, dt);
+        for _ in 0..(0.1 / DT) as usize {
+            hb.step(&controls, DT);
+            hr.step(&mut hb, DT);
         }
         let (g, h) = (gr.body.as_ref().unwrap(), hr.body.as_ref().unwrap());
-        let gaps = grip_gaps(&gb, g);
+        let gap = |bike: &Bike, body: &Body, k: usize| {
+            let anchor = body.solver.joints[body.grips[k].unwrap()].pa;
+            body.positions[index(GRIPS[k].0)].distance(bike.position + bike.orientation() * anchor)
+        };
         assert!(
-            (0..2).any(|k| g.grips[k].held && gaps[k] < 0.15),
-            "gentle crash let go: held {:?} gaps {gaps:?}",
-            g.grips.map(|x| x.held)
+            (0..2).any(|k| held(g, k) && gap(&gb, g, k) < 0.15),
+            "gentle crash let go: {:?}",
+            gr.let_go()
         );
         assert!(
-            !h.grips[0].held && !h.grips[1].held,
-            "hard impact kept its hands: gaps {:?}",
-            grip_gaps(&hb, h)
+            !held(h, 0) && !held(h, 1),
+            "hard impact kept its hands: {:?}",
+            hr.let_go()
         );
         assert_eq!(hr.let_go().unwrap().0, [true; 2]);
     }
@@ -624,14 +707,51 @@ mod tests {
         let mut bike = Bike::default();
         bike.collision_pose.hand_release = [1.0, 0.0];
         let mut ragdoll = Ragdoll::default();
-        let local = crate::scene::rider_points(&bike, &AnimationState::default());
-        let seed = ragdoll.sample(&bike, local, 1.0 / 120.0);
+        let seed = ragdoll.sample(&bike, rider_points(&bike, &AnimationState::default()), DT);
         ragdoll.activate(seed);
         assert_eq!(ragdoll.let_go().unwrap().0, [true, false]);
-        bike.position.x = -50.0;
+        // The bike is torn away at 50 m/s.
         for _ in 0..3 {
-            ragdoll.step(&bike, 1.0 / 120.0);
+            bike.position.x += 50.0 * DT;
+            ragdoll.step(&mut bike, DT);
         }
         assert_eq!(ragdoll.let_go().unwrap(), ([true; 2], [true; 2]));
+    }
+
+    #[test]
+    fn a_gripping_rider_drags_the_bike_and_momentum_is_conserved() {
+        let anim = AnimationState::default();
+        let mut bike = Bike::default();
+        bike.position.y += 60.0;
+        bike.velocity = Vec3::new(0.0, 0.0, -6.0);
+        bike.collision_pose = collision_pose(&bike, &anim);
+        let mut ragdoll = Ragdoll::default();
+        let seed = ragdoll.sample(&bike, rider_points(&bike, &anim), DT);
+        // The wreck stops dead; the rider, holding the bike, does not.
+        bike.velocity = Vec3::ZERO;
+        ragdoll.activate(seed);
+        let momentum = |bike: &Bike, body: &Body| {
+            body.solver.bodies[..LIMBS]
+                .iter()
+                .map(|b| b.v / b.inv_mass)
+                .sum::<Vec3>()
+                + bike.velocity * CRASH_MASS
+        };
+        let before = momentum(&bike, ragdoll.body.as_ref().unwrap());
+        for _ in 0..24 {
+            bike.position += bike.velocity * DT;
+            ragdoll.step(&mut bike, DT);
+        }
+        assert!(
+            bike.velocity.z < -0.5,
+            "bike was not dragged: {}",
+            bike.velocity
+        );
+        let after = momentum(&bike, ragdoll.body.as_ref().unwrap());
+        // Air drag takes a few per cent off the rider.
+        assert!(
+            (after.z - before.z).abs() < 0.05 * before.z.abs() && after.x.abs() < 1.0,
+            "momentum {before} -> {after}"
+        );
     }
 }
